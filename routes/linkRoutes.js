@@ -1,6 +1,5 @@
 import { Router } from "express";
-import createShortCode from "../services/linkServices.js";
-import { findOriginalUrlByCode } from "../repositories/linkRepository.js";
+import {createShortCode, getOGurl} from "../services/linkServices.js";
 
 const router = Router();
 
@@ -30,7 +29,7 @@ router.post("/links", async (req, res) => {
 
 router.get("/:code", async (req, res) => {
     try {
-        const original_url = await findOriginalUrlByCode(req.params.code);
+        const original_url = await getOGurl(req.params.code);
 
 
         if (original_url === null) {

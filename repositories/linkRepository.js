@@ -1,6 +1,7 @@
 import pool from "../config/db.js";
 
 export  async function findOriginalUrlByCode(code) {
+    console.log("Cache MISS: querying MySQL");
     const [rows] = await pool.execute("SELECT original_url from links where shortcode = ?",
         [code]
     );

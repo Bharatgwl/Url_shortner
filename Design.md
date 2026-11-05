@@ -1,30 +1,97 @@
-**My URL shortener uses Node.js and PostgreSQL.**
-**The database stores a short code, its original URL, and the creation time.**
-**Every short code must be unique.**
-**Multiple short codes can point to the same original URL.**
+# URL Shortener Design
 
-### Creating a short link
-1. Receive the original URL.
-2. Check that it is a valid HTTPS URL.
-3. Generate a random six-character code.
-4. Save the code and original URL in PostgreSQL. If the code already exists, retry with another code.
-5. Return http://localhost:8000/ followed by the code.
-### Opening a short link
-1. Receive the short code.
-2. Find its original URL in PostgreSQL.
-3. If found, redirect with 302.
-4. If missing, return 404.
+## Requirements
 
+- Stack: Node.js, Express, MySQL, and Redis.
+- Accept valid HTTPS destination URLs.
+- Generate a new six-character, case-sensitive code for every submission.
+- Multiple codes may point to the same destination; existing links remain valid.
+- Store mappings permanently in MySQL; keep temporary copies in Redis.
+- Return 302 for known codes, 404 for unknown codes, and 400 for invalid input.
 
-| Action | Endpoint | What happens |
-|--------|----------|--------------|
-| Create a short link | `POST /links` | Receives `original_url`; returns `short_url` with status `201` |
-| Open a short link | `GET /{code}` | Finds the code; returns `302` redirect or `404` |
+## Components and responsibilities
 
+| Component | Responsibility |
+| --- | --- |
+| server.js | Initialize the application, check MySQL, start Redis connection in the background, and listen for HTTP requests |
+| routes/linkRoutes.js | Read requests and send HTTP responses |
+| services/linkServices.js | Validate URLs, generate codes, retry collisions, and manage cache-aside lookups and fallback |
+| repositories/linkRepository.js | Execute parameterized SQL queries |
+| config/db.js | Configure the MySQL connection pool |
+| config/redis.js | Configure the Redis client, queue limit, and connection events |
 
-Start a Node.js server.
-[ ] Create the PostgreSQL links table.
-[ ] Connect the server to PostgreSQL.
-[ ] Implement creating a short link.
-[ ] Implement redirecting a short link.
-[ ] Check valid URLs, invalid URLs, unknown codes, and links after restarting.
+## API
+
+| Action | Endpoint | Result |
+| --- | --- | --- |
+| Health check | GET /health | 200; confirms the HTTP server responds, not a fresh database check |
+| Create link | POST /links | Receives original_url; returns short_url with 201 |
+| Open link | GET /:code | 302 with Location header, or 404 if no mapping exists |
+
+Register /health before the general /:code router.
+
+## MySQL schema
+
+| Column | Type | Constraint |
+| --- | --- | --- |
+| shortcode | VARCHAR(6), ASCII, ascii_bin collation | Primary key; case-sensitive |
+| original_url | TEXT | NOT NULL; duplicates allowed |
+| created_at | TIMESTAMP(6) | NOT NULL DEFAULT CURRENT_TIMESTAMP(6) |
+
+Generate a candidate, attempt insertion, and retry ER_DUP_ENTRY up to five total attempts. Other database failures are returned to the route immediately.
+
+## Redirect flow with caching
+
+1. If Redis is ready and the cooldown has expired, look up url:<code>.
+2. On a cache hit, return the URL without querying MySQL.
+3. On a cache miss, query MySQL and cache a found mapping for 300 seconds.
+4. On a Redis lookup error or a 500 ms waiting deadline, set a five-second cooldown and return the MySQL lookup result directly.
+5. During disconnection or cooldown, skip Redis and use MySQL.
+6. A failed cache write starts the cooldown but does not discard the URL obtained from MySQL.
+7. Return null for an unknown mapping; the route sends 404. MySQL failures propagate to the route as 500.
+
+## Completed implementation
+
+- [x] HTTP server and health route
+- [x] MySQL schema and connection pool
+- [x] Link creation, validation, and collision retries
+- [x] Case-sensitive redirects and persistence across restarts
+- [x] Routes, services, repositories, and configuration separated
+- [x] Redis cache-aside lookup with TTL
+- [x] MySQL fallback, non-blocking Redis startup, and reconnection
+- [x] Application waiting deadline, cooldown, and queue limit
+
+## Version 3: verified results
+
+Tests used http://localhost:8000/qH6jEB. HTTP clients did not follow redirects. Timings measure the shortener response, not the destination website. Values below are observations, not production guarantees.
+
+| Test | Conditions | Observed result | Evidence / meaning |
+| --- | --- | --- | --- |
+| Baseline without Redis caching | Six sequential local requests | All 302; average 3.35 ms, range 2.84-3.96 ms | Baseline only |
+| After caching | Eight sequential local requests | All 302; average 2.96 ms, range 2.76-3.10 ms | Small samples do not establish a reliable speedup |
+| Cached mapping and expiry | Redis running | GET returned the destination; TTL was 216 seconds | Mapping stored with an expiry |
+| Redis stopped | Live HTTP test | 302 through fallback | MySQL serves redirects during Redis disconnection |
+| Startup without Redis | Redis unavailable at startup | Server started; redirect worked | Redis is optional for application startup |
+| Redis restart | Redis restarted after outage | Two 302 responses; Redis GET counter increased by two | Client reconnected and resumed cache lookups |
+| Stalled Redis before deadline fix | Container paused | Curl timed out after approximately 5 seconds | Earlier client command-timeout option did not bound reply waiting |
+| Stalled Redis after deadline fix | Container paused | 302 in 518.439 ms | Application waiting deadline enabled MySQL fallback |
+| Redirect after unpause | Container resumed | 302 in 9.347 ms | HTTP service remained functional |
+| Cooldown: first request | Redis paused | 302 in 503.244 ms | Initial timeout followed by MySQL fallback |
+| Cooldown: immediate second request | Redis still paused, within five seconds | 302 in 2.386 ms | Cooldown skipped Redis |
+| Cache recovery after cooldown | Redis unpaused; cooldown expired | User observed two fresh Cache HIT logs | Cached reads resumed; recovery check complete |
+| Queue limit too small | Limit temporarily set to 2 | Redis handshake failed with queue-full errors | Startup commands also need queue capacity; restored limit to 100 |
+| Queue saturation: isolated service test | Actual service imported in a separate process; Redis paused; 120 simultaneous lookups; limit 100 | 20 queue-full errors, 100 waiting timeouts; all 120 returned a URL; approximately 517 ms for the batch | Queue rejection and timeout both fell back to MySQL |
+| Queue saturation: live HTTP test | Redis paused; 120 concurrent requests | 120 responses with status 302 | Live HTTP requests survived the test; Redis unpaused afterward |
+
+## Configuration and limitations
+
+| Setting | Current value |
+| --- | --- |
+| Cache key | url:<case-sensitive code> |
+| Cache TTL | 300 seconds |
+| Per-cache-operation waiting deadline | 500 ms |
+| Failure cooldown | 5 seconds, local to each Node.js process |
+| Redis pending-command queue limit | 100 |
+| Offline command queueing | Disabled |
+
+The queue limit is a learning configuration, not a tuned capacity estimate. The waiting deadline does not cancel sent Redis commands. The cooldown reduces retries but does not cancel existing work or coordinate simultaneous requests. See CACHING.md for concepts and remaining gaps.
