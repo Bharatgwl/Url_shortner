@@ -1,5 +1,22 @@
 # URL Shortener Design
 
+## Version stages and current status
+
+**Current stage: Version 3 complete. Version 4 is planned and has not started.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
+
+| Stage | Status | Implementation | Validation |
+| --- | --- | --- | --- |
+| Version 1: functional URL shortener | Complete | Node.js/Express server; HTTPS validation; MySQL schema and pool; six-character codes; case-sensitive primary key; five collision attempts; POST /links and GET /:code; normalized URL storage; environment settings | Valid and invalid input; 201 creation; 302 redirect; 404 for unknown code; duplicate-code retries; repeated destinations; persistence across restarts |
+| Version 2: layered application | Complete | Extracted config/db.js, repositories/linkRepository.js, services/linkServices.js, and routes/linkRoutes.js; validation and creation logic in the service; HTTP responses in routes; SQL in repository | Syntax checks and create/open/error flows after refactoring; corrected /health registration order; corrected missing short-code generation during refactor |
+| Version 3: Redis cache and resilience | Complete | Redis in Docker; cache-aside reads; 300-second TTL; MySQL fallback; background connection and reconnection; 500 ms application waiting deadline; five-second cooldown; queue limit 100; offline queue disabled | Cache GET/TTL; hits and misses; stopped and stalled Redis; startup without Redis; reconnection; cooldown and recovery; queue saturation and 120 concurrent HTTP requests |
+| Version 4: multiple application instances | Planned | Configurable listening ports, two instances, shared MySQL and Redis, and a load balancer | Verify distribution and behavior when one instance stops |
+| Version 5: background analytics | Planned | Click events, queue, worker, and retry handling | Verify event processing and failure recovery |
+| Version 6: evaluate service separation | Planned | Consider separate URL-generation and redirect services when justified by measured needs | Define requirements and measure before splitting |
+
+Version 1 queried MySQL directly for redirects. Version 2 changed code organization while retaining one process. Version 3 added the external cache and cache-failure handling. The sections below describe the latest implementation.
+
+The application and MySQL currently run locally; Redis runs in Docker. There is no application load balancer, separate analytics worker, or independently deployed generation/redirect service yet.
+
 ## Requirements
 
 - Stack: Node.js, Express, MySQL, and Redis.
