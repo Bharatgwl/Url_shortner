@@ -2,20 +2,20 @@
 
 ## Version stages and current status
 
-**Current stage: Version 3 complete. Version 4 is planned and has not started.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
+**Current stage: Version 4 complete. Version 5 is planned.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
 
 | Stage | Status | Implementation | Validation |
 | --- | --- | --- | --- |
 | Version 1: functional URL shortener | Complete | Node.js/Express server; HTTPS validation; MySQL schema and pool; six-character codes; case-sensitive primary key; five collision attempts; POST /links and GET /:code; normalized URL storage; environment settings | Valid and invalid input; 201 creation; 302 redirect; 404 for unknown code; duplicate-code retries; repeated destinations; persistence across restarts |
 | Version 2: layered application | Complete | Extracted config/db.js, repositories/linkRepository.js, services/linkServices.js, and routes/linkRoutes.js; validation and creation logic in the service; HTTP responses in routes; SQL in repository | Syntax checks and create/open/error flows after refactoring; corrected /health registration order; corrected missing short-code generation during refactor |
 | Version 3: Redis cache and resilience | Complete | Redis in Docker; cache-aside reads; 300-second TTL; MySQL fallback; background connection and reconnection; 500 ms application waiting deadline; five-second cooldown; queue limit 100; offline queue disabled | Cache GET/TTL; hits and misses; stopped and stalled Redis; startup without Redis; reconnection; cooldown and recovery; queue saturation and 120 concurrent HTTP requests |
-| Version 4: multiple application instances | Planned | Configurable listening ports, two instances, shared MySQL and Redis, and a load balancer | Verify distribution and behavior when one instance stops |
+| Version 4: multiple application instances | Complete | PORT configuration; two host Node.js instances on 8000/8001; shared MySQL/Redis; Docker Nginx on 8080; BASE_URL set to the common address | Cross-instance link access; round-robin logs; GET and POST with 8001 unavailable; redirect and recovery verified |
 | Version 5: background analytics | Planned | Click events, queue, worker, and retry handling | Verify event processing and failure recovery |
 | Version 6: evaluate service separation | Planned | Consider separate URL-generation and redirect services when justified by measured needs | Define requirements and measure before splitting |
 
 Version 1 queried MySQL directly for redirects. Version 2 changed code organization while retaining one process. Version 3 added the external cache and cache-failure handling. The sections below describe the latest implementation.
 
-The application and MySQL currently run locally; Redis runs in Docker. There is no application load balancer, separate analytics worker, or independently deployed generation/redirect service yet.
+Two application processes and MySQL run locally; Redis and Nginx run in Docker. Nginx distributes requests to the host applications. There is no analytics worker or independently deployed generation/redirect service yet.
 
 ## Requirements
 
@@ -36,6 +36,7 @@ The application and MySQL currently run locally; Redis runs in Docker. There is 
 | repositories/linkRepository.js | Execute parameterized SQL queries |
 | config/db.js | Configure the MySQL connection pool |
 | config/redis.js | Configure the Redis client, queue limit, and connection events |
+| nginx/nginx.conf | Reverse proxy and round-robin upstream group for ports 8000/8001 |
 
 ## API
 
@@ -100,7 +101,26 @@ Tests used http://localhost:8000/qH6jEB. HTTP clients did not follow redirects. 
 | Queue saturation: isolated service test | Actual service imported in a separate process; Redis paused; 120 simultaneous lookups; limit 100 | 20 queue-full errors, 100 waiting timeouts; all 120 returned a URL; approximately 517 ms for the batch | Queue rejection and timeout both fell back to MySQL |
 | Queue saturation: live HTTP test | Redis paused; 120 concurrent requests | 120 responses with status 302 | Live HTTP requests survived the test; Redis unpaused afterward |
 
-## Configuration and limitations
+## Version 4: load balancing and verified results
+
+Public local entry point: `http://localhost:8080`. Nginx listens on container port 80 and forwards to `host.docker.internal:8000` or `:8001`. Both application instances use the same database and Redis, while each has its own connection pool and in-memory cache cooldown.
+
+`PORT` selects each process's listening port; the current fallback is 8888. `BASE_URL=http://localhost:8080` generates client-facing links. It is used during link creation, not appended during redirect lookup.
+
+| Test | Observed result | Evidence source |
+| --- | --- | --- |
+| Direct health checks | Both 8000 and 8001 returned 200 | Agent checks and user confirmation |
+| Cross-instance mapping | Link created on 8000 opened on 8001 | User test |
+| Distribution through 8080 | Both instance terminals received requests | Agent background-instance logs and user terminal confirmation |
+| GET failover with 8001 unavailable | Six requests through Nginx returned 200 | Agent-controlled HTTP test |
+| POST with 8001 unavailable | 201 with a short URL using port 8080 | Agent-controlled HTTP test |
+| Redirect with 8001 unavailable | 302 with the correct destination | Agent-controlled HTTP test |
+| Recovery after restarting 8001 | Both direct checks returned 200; ten Nginx checks returned 200; 8001 received traffic again | Agent-controlled HTTP test and instance logs |
+| Process ownership cleanup | Agent-started 8001 stopped; user restarted it and observed logs | Agent verification followed by user confirmation |
+
+These tests verify local process failover, not machine-level high availability or throughput scaling. Successful POST creation while one instance is already down does not prove safe retries after a partially completed POST. Nginx has no custom active health probe or explicit timeout policy in this config. See SCALING.md for details.
+
+## Configuration and limitations (current)
 
 | Setting | Current value |
 | --- | --- |

@@ -2,7 +2,7 @@
 
 A learning project built with Node.js, Express, MySQL, and Redis. It creates short links for HTTPS URLs and redirects visitors to the saved destination.
 
-**Current stage: Version 3 complete - Redis caching and cache-failure resilience.** These are learning milestones; the npm package version is still `1.0.0`.
+**Current stage: Version 4 complete - two application instances behind Nginx.** These are learning milestones; the npm package version is still `1.0.0`.
 
 ## Version stages
 
@@ -11,11 +11,13 @@ A learning project built with Node.js, Express, MySQL, and Redis. It creates sho
 | Version 1: working URL shortener | Complete | HTTP server, HTTPS validation, MySQL mappings, six-character case-sensitive codes, collision retries, redirects, and basic error handling |
 | Version 2: layered application | Complete | Separate routes, business logic, SQL queries, and connection configuration into modules |
 | Version 3: Redis cache and resilience | Complete | Cache-aside, TTL, MySQL fallback, optional Redis startup, reconnection, 500 ms waiting deadline, five-second cooldown, and queue limit |
-| Version 4: multiple instances and load balancing | Planned | Run two application instances using shared MySQL and Redis, then add a load balancer |
+| Version 4: multiple instances and load balancing | Complete | Two host Node.js processes on ports 8000/8001 behind Docker Nginx on 8080; shared MySQL/Redis; distribution, failover, and recovery verified locally |
 | Version 5: background analytics | Planned | Record click events through a queue and worker |
 | Version 6: evaluate service separation | Planned | Consider independent generation and redirect services based on measured needs |
 
 See [Design.md](Design.md) for design decisions and verified results, and [CACHING.md](CACHING.md) for caching concepts and limitations.
+
+See [SCALING.md](SCALING.md) for Version 4 concepts, request flow, and failover limitations.
 
 ## Features
 
@@ -33,12 +35,12 @@ See [Design.md](Design.md) for design decisions and verified results, and [CACHI
 
 ## Current architecture
 
-One Node.js application process handles requests. MySQL stores authoritative mappings; Redis stores temporary copies. The Node.js application runs on the host; Redis runs in Docker. MySQL is the existing local installation.
+Nginx in Docker exposes one local entry point at `http://localhost:8080` and distributes requests across two Node.js processes on host ports 8000 and 8001. Both use the same local MySQL database and Docker Redis cache.
 
 ```text
-Client -> Express routes -> Link service -> Redis (cache)
-                                        -> MySQL repository -> MySQL
-                                           (miss / cache failure)
+Client -> Nginx :8080 -> App :8000 or App :8001
+                         Both -> shared Redis cache
+                         Both -> shared MySQL database
 ```
 
 ```text
@@ -48,9 +50,10 @@ services/linkServices.js
 repositories/linkRepository.js
 config/db.js
 config/redis.js
+nginx/nginx.conf
 ```
 
-Moving code into modules did not create separate network services. Load balancing and multiple application instances are not implemented yet.
+These are two instances of the same application, not separate generation and redirect microservices. All components still run on one computer.
 
 ## Requirements
 
@@ -97,11 +100,11 @@ DB_PORT=3306
 DB_USER=your_mysql_user
 DB_PASSWORD="your_mysql_password"
 DB_NAME=url_shortner
-BASE_URL=http://localhost:8000
+BASE_URL=http://localhost:8080
 REDIS_URL=redis://127.0.0.1:6379
 ```
 
-Use no trailing slash in `BASE_URL`. The server currently listens on the hardcoded port `8000`; changing `BASE_URL` changes returned links, not the listening port.
+Use no trailing slash in `BASE_URL`. It controls returned links, not the listening port. Set `PORT` separately in each terminal as shown below. The current code defaults to port `8888` if `PORT` is absent; the Nginx setup requires explicitly using 8000 and 8001.
 
 Keep `.env` and `node_modules/` in `.gitignore`. Never commit actual credentials.
 
@@ -122,17 +125,23 @@ docker start url-shortener-redis
 
 The port binding exposes Redis only on the local machine. No persistent Redis volume is configured; MySQL remains the source of truth.
 
-### 5. Start the server
+### 5. Start both application instances
 
-```sh
-npm run dev
-```
+From the project root, open two PowerShell terminals. In terminal 1:
 
-This uses globally installed nodemon to restart the server when files change. To run without nodemon:
-
-```sh
+```powershell
+$env:PORT="8000"
 node server.js
 ```
+
+In terminal 2:
+
+```powershell
+$env:PORT="8001"
+node server.js
+```
+
+Each terminal must show its assigned listening port. `node server.js` does not reload edits automatically; restart both processes after code or environment-file changes. Alternatively, `npm run dev` uses globally installed nodemon with the PORT assigned in that terminal.
 
 The server checks MySQL before listening. Redis connects in the background, so its ready message may appear before or after the listening message:
 
@@ -143,6 +152,18 @@ Redis ready: caching available
 ```
 
 If Redis is down, connection errors and reconnect attempts are logged, but MySQL-backed requests can still be served. If the initial MySQL check fails, the server does not start listening.
+
+### 6. Start Nginx
+
+From the project root in another PowerShell terminal, create the container once:
+
+```powershell
+docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind,source=$($PWD.Path)\nginx\nginx.conf,target=/etc/nginx/nginx.conf,readonly" nginx:stable-alpine
+```
+
+For later runs, use `docker start url-shortener-nginx`. Nginx reaches the host applications through `host.docker.internal:8000` and `:8001`. The mounted config is `nginx/nginx.conf`.
+
+Check `http://localhost:8080/health` and send application requests through port 8080. Both Node.js terminals log their handled requests. Direct ports 8000/8001 are for local checks; generated links use 8080.
 
 ## API
 
@@ -168,7 +189,7 @@ Example response: `201 Created`.
 
 ```json
 {
-  "short_url": "http://localhost:8000/abc123"
+  "short_url": "http://localhost:8080/abc123"
 }
 ```
 
@@ -234,7 +255,7 @@ A positive TTL is the remaining lifetime in seconds. `-2` means the key is missi
 For HTTP timing on Windows, replace `YOUR_CODE` with a saved code. Do not add `-L`, which would follow the redirect:
 
 ```powershell
-curl.exe --max-time 5 -sS -o NUL -w "Status: %{http_code} | Time: %{time_total}s\n" http://localhost:8000/YOUR_CODE
+curl.exe --max-time 5 -sS -o NUL -w "Status: %{http_code} | Time: %{time_total}s\n" http://localhost:8080/YOUR_CODE
 ```
 
 | Verified scenario | Observed result |
@@ -251,8 +272,8 @@ These are local learning tests, not production capacity guarantees. For outage t
 
 ## Current limits and future work
 
-This is a local learning version with one application server, one MySQL database, and one optional Redis cache. `localhost` links refer to the visitor's own computer and are not public shareable links.
+This is a local learning setup with two application processes, one Nginx container, one MySQL database, and one optional Redis cache on the same computer. Application-process failover is verified, but a machine failure still stops the entire setup. `localhost` links are not public shareable links.
 
 The waiting deadline does not cancel underlying Redis commands. Cooldown state is per application process; simultaneous misses are not coalesced. Cache outages transfer traffic to MySQL. The queue limit is not an HTTP rate limit, and there is no overall HTTP request deadline.
 
-Next is Version 4: multiple instances and a load balancer. Later work includes automated tests, deployment, rate limiting, abuse controls, background analytics, URL expiry, and measured scaling. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
+Next is Version 5: background click analytics. Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
