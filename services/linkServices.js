@@ -3,9 +3,11 @@ import {
     findOriginalUrlByCode,
 } from "../repositories/linkRepository.js";
 import redisClient from "../config/redis.js";
+import withTimeout from "../utils/withTimeout.js";
 // Redis fail ho toh is time tak cache skip karenge. 0 ka matlab abhi try kar sakte hain.
 // Yeh time sirf is Node.js process ki memory mein rehta hai.
 let cacheRetryAfter = 0;
+
 
 // Random code banao; unique hai ya nahi, MySQL insert ke waqt check karega.
 function generateCode() {
@@ -48,27 +50,7 @@ function validateOriginalUrl(value) {
 }
 
 // Redis ka wait 500 ms tak karo. Yeh underlying Redis command ko cancel nahi karta.
-async function withCacheTimeout(redisOperation) {
-    let timer;
 
-    // 500 ms baad yeh promise reject hoga, yani timeout error dega.
-    const timeout = new Promise((resolve, reject) => {
-        const throw_timeout_error = () => {
-            reject(new Error("Redis response timed out"));
-        }
-        timer = setTimeout(throw_timeout_error, 500);
-    });
-
-    try {
-        // Jo pehle settle hoga woh result decide karega: Redis ka reply/error ya timeout.
-        // Race reject hui toh error caller ke catch tak jayega.
-        const result = await Promise.race([redisOperation, timeout]);
-        return result;
-    } finally {
-        // Success ho ya error, finally chalega aur timer saaf karega.
-        clearTimeout(timer);
-    }
-}
 export async function createShortCode(originalUrl) {
 
     // Database mein kuch likhne se pehle URL ko ek baar validate karo.
@@ -101,7 +83,7 @@ export async function getOGurl(code) {
     if (redisClient.isReady && Date.now() >= cacheRetryAfter) {
         try {
             // Redis se is code ki mapping maango; maximum 500 ms wait karo.
-            const cachedURL = await withCacheTimeout(
+            const cachedURL = await withTimeout(
                 redisClient.get(`url:${code}`)
             );
             if (cachedURL !== null) {
@@ -134,7 +116,7 @@ export async function getOGurl(code) {
     if (originalURL !== null && redisClient.isReady && Date.now() >= cacheRetryAfter) {
         try {
             // EX: 300 se Redis ki copy 5 minute baad expire hogi; MySQL row nahi mitegi.
-            await withCacheTimeout(
+            await withTimeout(
                 redisClient.set(`url:${code}`, originalURL, { EX: 300 })
             );
         } catch (error) {

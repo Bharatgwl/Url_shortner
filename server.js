@@ -3,6 +3,7 @@ import "dotenv/config";
 import pool from "./config/db.js"
 import redisClient from "./config/redis.js";
 import linkRoutes from "./routes/linkRoutes.js"
+import queueClient from "./config/queueRedis.js";
 
 const port = Number(process.env.PORT || 8888);
 
@@ -30,6 +31,9 @@ try {
         console.error("Redis connection failed:", error.message);
     });
 
+    queueClient.connect().catch((error)=>{
+        console.error("Queue connection failed:", error.message);
+    })
 
     app.listen(port, () => {
         console.log(`Server listening on ${port}`);

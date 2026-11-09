@@ -1,0 +1,21 @@
+﻿flowchart LR
+  U["Client"] -->|":8080"| N["NGINX"]
+  N --> A["Node / Express :8000"]
+  N --> B["Node / Express :8001"]
+  A <--> C[("Shared Redis cache :6379")]
+  B <--> C
+  A <--> D[("MySQL URL mappings")]
+  B <--> D
+  A --> P["Click publisher"]
+  B --> P
+  subgraph Q["Queue Redis :6380"]
+    S[("Stream analytics:clicks - original entries")]
+    G["Group click-workers: pending tracking / PEL; owner worker-1"]
+    S -->|"Track entry ID on delivery"| G
+  end
+  P -->|"XADD"| S
+  S -->|"XREADGROUP"| W["Separate Node.js worker process"]
+  W -->|"Save or already saved"| DB[("MySQL click_events; event_id unique")]
+  W -->|"XACK only after save; clears pending record"| G
+  G -->|"id 0: retry this consumer's pending IDs"| W
+  NOTE["XACK does NOT delete stream entries. XDEL / trimming is separate."]

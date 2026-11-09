@@ -1,5 +1,6 @@
 import { Router } from "express";
 import {createShortCode, getOGurl} from "../services/linkServices.js";
+import { publishClickEvents } from "../queues/clickQueue.js";
 
 const router = Router();
 
@@ -37,7 +38,12 @@ router.get("/:code", async (req, res) => {
                 error: "Short link not found",
             });
         }
+        try{
+            await publishClickEvents(req.params.code);
 
+        }catch(err){
+            console.error("Click event publish failed", err.message);
+        }
         return res.redirect(302, original_url);
     } catch (error) {
         console.error("Failed to find link:", error.message);

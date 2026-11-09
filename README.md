@@ -2,7 +2,7 @@
 
 A learning project built with Node.js, Express, MySQL, and Redis. It creates short links for HTTPS URLs and redirects visitors to the saved destination.
 
-**Current stage: Version 4 complete - two application instances behind Nginx.** These are learning milestones; the npm package version is still `1.0.0`.
+**Current stage: Version 5 core analytics implemented and locally tested - Redis Streams, two workers, retry handling, failed events, and pending-event recovery.** These are learning milestones; the npm package version is still `1.0.0`.
 
 ## Version stages
 
@@ -12,7 +12,7 @@ A learning project built with Node.js, Express, MySQL, and Redis. It creates sho
 | Version 2: layered application | Complete | Separate routes, business logic, SQL queries, and connection configuration into modules |
 | Version 3: Redis cache and resilience | Complete | Cache-aside, TTL, MySQL fallback, optional Redis startup, reconnection, 500 ms waiting deadline, five-second cooldown, and queue limit |
 | Version 4: multiple instances and load balancing | Complete | Two host Node.js processes on ports 8000/8001 behind Docker Nginx on 8080; shared MySQL/Redis; distribution, failover, and recovery verified locally |
-| Version 5: background analytics | Planned | Record click events through a queue and worker |
+| Version 5: background analytics | Implemented; local tests passed | Separate Redis Streams queue, click events, MySQL deduplication, two consumer workers, three-attempt failure handling, failed stream, and idle pending-event recovery |
 | Version 6: evaluate service separation | Planned | Consider independent generation and redirect services based on measured needs |
 
 See [Design.md](Design.md) for design decisions and verified results, and [CACHING.md](CACHING.md) for caching concepts and limitations.
@@ -32,15 +32,22 @@ See [SCALING.md](SCALING.md) for Version 4 concepts, request flow, and failover 
 - A 500 ms application waiting deadline per cache operation and a five-second failure cooldown.
 - A Redis client queue limit of 100 with offline queueing disabled.
 - Background Redis reconnection; the server can start without Redis when MySQL is available.
+- Click events published for known short links, including cache hits.
+- A separate Redis queue on port 6380; cache Redis remains on 6379.
+- A 500 ms waiting deadline for publishing; publish failures are logged and the redirect continues.
+- Background workers in one consumer group, with MySQL event-ID deduplication and ACK after saving.
+- Three recorded save failures before transfer to a failed-event stream.
+- Recovery of idle pending events through XAUTOCLAIM, using a 60-second idle threshold.
 
 ## Current architecture
 
-Nginx in Docker exposes one local entry point at `http://localhost:8080` and distributes requests across two Node.js processes on host ports 8000 and 8001. Both use the same local MySQL database and Docker Redis cache.
+Nginx in Docker exposes one local entry point at `http://localhost:8080` and distributes requests across two Node.js processes on host ports 8000 and 8001. Both use the same local MySQL database, Docker Redis cache, and a separate Docker Redis queue. Two independent Node.js worker processes consume click events into MySQL.
 
 ```text
 Client -> Nginx :8080 -> App :8000 or App :8001
                          Both -> shared Redis cache
                          Both -> shared MySQL database
+                         Both -> Redis queue :6380 -> worker-1 / worker-2 -> MySQL click_events
 ```
 
 ```text
@@ -50,6 +57,13 @@ services/linkServices.js
 repositories/linkRepository.js
 config/db.js
 config/redis.js
+config/queueRedis.js
+queues/clickQueue.js
+queues/clickRetries.js
+queues/failedClickQueue.js
+repositories/clickRepository.js
+workers/clickWorker.js
+utils/withTimeout.js
 nginx/nginx.conf
 ```
 
@@ -59,7 +73,7 @@ These are two instances of the same application, not separate generation and red
 
 - Node.js with ES module and top-level await support, and npm.
 - A running MySQL server; MySQL Workbench is optional.
-- Docker Desktop for the local Redis container. Redis is optional for serving requests, but required to exercise caching.
+- Docker Desktop for Nginx and the two Redis containers. Cache and queue Redis are optional for serving redirects, but required to exercise their respective features.
 - Globally installed nodemon if using `npm run dev`.
 
 ## Setup
@@ -102,6 +116,7 @@ DB_PASSWORD="your_mysql_password"
 DB_NAME=url_shortner
 BASE_URL=http://localhost:8080
 REDIS_URL=redis://127.0.0.1:6379
+QUEUE_REDIS_URL=redis://127.0.0.1:6380
 ```
 
 Use no trailing slash in `BASE_URL`. It controls returned links, not the listening port. Set `PORT` separately in each terminal as shown below. The current code defaults to port `8888` if `PORT` is absent; the Nginx setup requires explicitly using 8000 and 8001.
@@ -123,7 +138,7 @@ Expected reply: `PONG`. Docker downloads the image if it is not already present.
 docker start url-shortener-redis
 ```
 
-The port binding exposes Redis only on the local machine. No persistent Redis volume is configured; MySQL remains the source of truth.
+The port binding exposes cache Redis only on the local machine. Cache data is disposable; MySQL remains the source of truth for URL mappings.
 
 ### 5. Start both application instances
 
@@ -164,6 +179,41 @@ docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind
 For later runs, use `docker start url-shortener-nginx`. Nginx reaches the host applications through `host.docker.internal:8000` and `:8001`. The mounted config is `nginx/nginx.conf`.
 
 Check `http://localhost:8080/health` and send application requests through port 8080. Both Node.js terminals log their handled requests. Direct ports 8000/8001 are for local checks; generated links use 8080.
+
+### 7. Set up the analytics queue and workers
+
+For a fresh installation, create the click table in `url_shortner`. Skip this SQL when the table already exists. The current click table allows up to 36 characters for `shortcode`; generated link codes remain six characters.
+
+```sql
+CREATE TABLE click_events (
+    event_id VARCHAR(36) NOT NULL,
+    shortcode VARCHAR(36) NOT NULL,
+    occurred_at DATETIME(3) NOT NULL,
+    PRIMARY KEY (event_id)
+);
+```
+
+Create the queue container once, with AOF and a named data volume:
+
+```powershell
+docker run -d --name url-shortener-queue -p 127.0.0.1:6380:6379 -v url-shortener-queue-data:/data redis:7-alpine redis-server --appendonly yes
+docker exec url-shortener-queue redis-cli PING
+docker exec url-shortener-queue redis-cli XGROUP CREATE analytics:clicks click-workers 0 MKSTREAM
+```
+
+`MKSTREAM` creates the stream if needed. `BUSYGROUP` means this group already exists; do not recreate it. Group creation is a one-time manual setup step, not part of worker startup. For later runs use `docker start url-shortener-queue`. Persistence reduces restart data loss; it does not guarantee that every acknowledged Redis write survives a machine failure.
+
+Run the same worker file in two separate terminals from the project root:
+
+```powershell
+node .\workers\clickWorker.js worker-1
+```
+
+```powershell
+node .\workers\clickWorker.js worker-2
+```
+
+Each simultaneously running worker needs its own consumer name. Without an argument, the file defaults to `worker-1`. Both use the `click-workers` group on `analytics:clicks`. Group distribution is not guaranteed to be 50/50. Restart worker processes after editing their source; `node` does not automatically reload it.
 
 ## API
 
@@ -221,7 +271,9 @@ Example: `GET /abc123`.
 
 **Create:** client sends URL -> server validates -> generates code -> inserts mapping -> returns short URL. A duplicate code triggers another attempt, up to five total attempts.
 
-**Open:** browser sends code -> service checks Redis when ready and outside cooldown -> a hit returns immediately; a miss queries MySQL and caches a found mapping -> route returns a redirect or 404 -> browser requests the destination website.
+**Open:** browser sends code -> service resolves the destination through cache/MySQL -> unknown code returns 404 -> a found destination triggers a bounded attempt to publish a click event -> route returns 302 -> browser requests the destination website. A cache hit skips MySQL mapping lookup but still publishes a click event.
+
+**Analytics:** Redis stream -> consumer worker -> MySQL click_events -> ACK -> clear the failure counter. The HTTP route waits for the queue publish attempt, up to its 500 ms deadline, but does not wait for the worker or click-table insert. Queue publish errors still allow the redirect.
 
 Redis lookup failures use MySQL directly and start a five-second cooldown. Cache-write failures still return the URL found in MySQL. Unknown mappings are not cached. See [CACHING.md](CACHING.md) for the full failure flow.
 
@@ -270,10 +322,33 @@ curl.exe --max-time 5 -sS -o NUL -w "Status: %{http_code} | Time: %{time_total}s
 
 These are local learning tests, not production capacity guarantees. For outage tests, always restart or unpause Redis afterward. The 120-request test script, if retained as `queue-test.js`, is a manual load helper, not a replacement for assertions or an automated test suite.
 
+### Analytics checks and verified results
+
+```powershell
+docker exec url-shortener-queue redis-cli XREVRANGE analytics:clicks + - COUNT 1
+docker exec url-shortener-queue redis-cli XPENDING analytics:clicks click-workers
+docker exec url-shortener-queue redis-cli XREVRANGE analytics:clicks:failed + - COUNT 1
+```
+
+Each click gets a new application `event_id` UUID. Retries reuse that UUID; the MySQL primary key prevents duplicate rows. Redis also assigns a separate stream entry ID used for ACK and pending ownership. ACK removes pending tracking, not the original stream entry. A pending count of zero alone does not prove successful analytics; check worker logs and MySQL too.
+
+| Verified scenario | Observed result |
+| --- | --- |
+| Known-link redirect | 302 and a click event published; worker saved the event and ACKed |
+| Duplicate save of one application event ID | One MySQL row; duplicate handling allowed processing to finish |
+| Queue Redis unavailable | User observed 302 redirects; worker reconnected after Redis returned and processed later events |
+| Invalid oversized shortcode followed by a valid event | Agent observed exactly three save failures, one failed-stream entry with attempts=3, original ACK, cleared counters, zero test events pending, and one valid MySQL row; agent test data cleaned up |
+| Two live consumers | User observed Event processed logs in both worker terminals |
+| Event assigned to stopped worker-1 | User observed pending=1 owned by worker-1, then pending=0 after worker-2 ran; the recovered NJ75eh event was confirmed in MySQL |
+
+See [Design.md](Design.md) for the worker decision flow, the manually created recovery fixture, and remaining delivery limitations. These checks are local observations; automated coverage is still limited.
+
 ## Current limits and future work
 
-This is a local learning setup with two application processes, one Nginx container, one MySQL database, and one optional Redis cache on the same computer. Application-process failover is verified, but a machine failure still stops the entire setup. `localhost` links are not public shareable links.
+This is a local learning setup with two application processes, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. Application-process failover is verified, but a machine failure still stops the entire setup. `localhost` links are not public shareable links.
 
 The waiting deadline does not cancel underlying Redis commands. Cooldown state is per application process; simultaneous misses are not coalesced. Cache outages transfer traffic to MySQL. The queue limit is not an HTTP rate limit, and there is no overall HTTP request deadline.
 
-Next is Version 5: background click analytics. Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
+Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. Follow-up work includes failed-event replay, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
+
+Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
