@@ -2,7 +2,7 @@
 
 ## Version stages and current status
 
-**Current stage: Version 5 core analytics implemented and locally tested, including two consumers, retry handling, a failed stream, and pending-event recovery.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
+**Current stage: Version 5 complete for the agreed learning milestone, including analytics workers, recovery, a stats API, indexed counts, and a verified manual replay.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
 
 | Stage | Status | Implementation | Validation |
 | --- | --- | --- | --- |
@@ -10,7 +10,7 @@
 | Version 2: layered application | Complete | Extracted config/db.js, repositories/linkRepository.js, services/linkServices.js, and routes/linkRoutes.js; validation and creation logic in the service; HTTP responses in routes; SQL in repository | Syntax checks and create/open/error flows after refactoring; corrected /health registration order; corrected missing short-code generation during refactor |
 | Version 3: Redis cache and resilience | Complete | Redis in Docker; cache-aside reads; 300-second TTL; MySQL fallback; background connection and reconnection; 500 ms application waiting deadline; five-second cooldown; queue limit 100; offline queue disabled | Cache GET/TTL; hits and misses; stopped and stalled Redis; startup without Redis; reconnection; cooldown and recovery; queue saturation and 120 concurrent HTTP requests |
 | Version 4: multiple application instances | Complete | PORT configuration; two host Node.js instances on 8000/8001; shared MySQL/Redis; Docker Nginx on 8080; BASE_URL set to the common address | Cross-instance link access; round-robin logs; GET and POST with 8001 unavailable; redirect and recovery verified |
-| Version 5: background analytics | Implemented; local tests passed | Separate Redis Streams queue; bounded publishing; click_events deduplication; named consumers; three-attempt failure handling; failed stream; XAUTOCLAIM recovery after 60 seconds idle | Publish/save/ACK; duplicate save; worker backlog and queue recovery; controlled failure then valid processing; two consumers; user-confirmed pending recovery and MySQL row |
+| Version 5: background analytics | Complete; local tests passed | Separate Redis Streams queue; bounded publishing; MySQL deduplication; two consumers; retries and failed stream; XAUTOCLAIM recovery; stats endpoint and shortcode index | Publish/save/ACK; duplicates; queue and worker recovery; three-failure handling; two consumers; stats cases; EXPLAIN comparison; corrected manual replay |
 | Version 6: evaluate service separation | Planned | Consider separate URL-generation and redirect services when justified by measured needs | Define requirements and measure before splitting |
 
 Version 1 queried MySQL directly for redirects. Version 2 changed code organization while retaining one process. Version 3 added the external cache and cache-failure handling. The sections below describe the latest implementation.
@@ -39,7 +39,7 @@ Two application processes, two analytics worker processes, and MySQL run locally
 | nginx/nginx.conf | Reverse proxy and round-robin upstream group for ports 8000/8001 |
 | config/queueRedis.js | Separate Redis queue connection on port 6380, offline queue disabled and command queue capped at 100 |
 | queues/clickQueue.js | Generate a click UUID and UTC timestamp, then publish through bounded XADD |
-| repositories/clickRepository.js | Parameterized click insert; treat duplicate event_id as already saved |
+| repositories/clickRepository.js | Parameterized click insert, duplicate event-ID handling, and shortcode-filtered count query |
 | workers/clickWorker.js | Read own pending events, reclaim idle entries, read new events, save, ACK, and retry |
 | queues/clickRetries.js | Redis hash counters keyed by stream entry ID |
 | queues/failedClickQueue.js | Copy failed events with error details into the failed stream |
@@ -52,6 +52,7 @@ Two application processes, two analytics worker processes, and MySQL run locally
 | Health check | GET /health | 200; confirms the HTTP server responds, not a fresh database check |
 | Create link | POST /links | Receives original_url; returns short_url with 201 |
 | Open link | GET /:code | 302 with Location header, or 404 if no mapping exists |
+| Link statistics | GET /links/:code/stats | 200 with shortcode and numeric total_clicks; existing unvisited link returns zero; unknown code returns 404 |
 
 Register /health before the general /:code router.
 
@@ -91,6 +92,8 @@ Generate a candidate, attempt insertion, and retry ER_DUP_ENTRY up to five total
 - [x] Two named consumer workers and save-before-ACK ordering
 - [x] Three-attempt save-failure handling and failed stream
 - [x] Idle pending-event recovery through XAUTOCLAIM
+- [x] Stats API, zero-click and unknown-code handling, and shortcode count index
+- [x] Manual corrected failed-event replay verified; automatic tooling remains deferred
 
 ## Version 3: verified results
 
@@ -164,7 +167,7 @@ The queue limit is a learning configuration, not a tuned capacity estimate. The 
 
 The queue Redis instance uses host port 6380; cache Redis uses 6379. Separate clients connect each process to those Redis servers. A client is a connection object, not a stream or a worker. The group is created once with `XGROUP CREATE analytics:clicks click-workers 0 MKSTREAM`; consumers are registered when used by group commands.
 
-The current click_events table has event_id VARCHAR(36) as primary key, shortcode VARCHAR(36), and occurred_at DATETIME(3), all NOT NULL. The repository stores occurred_at as a UTC-derived SQL date-time string; DATETIME itself carries no timezone. Each real click gets a fresh UUID; a processing retry retains the original UUID.
+The current click_events table has event_id VARCHAR(36) as primary key, shortcode VARCHAR(36) with ASCII/ascii_bin case-sensitive collation, and occurred_at DATETIME(3), all NOT NULL. The repository stores occurred_at as a UTC-derived SQL date-time string; DATETIME itself carries no timezone. Each real click gets a fresh UUID; a processing retry retains the original UUID.
 
 ### HTTP and worker flows
 
@@ -217,6 +220,27 @@ The recovery fixture used stream entry ID 1794256187754-0. Its application event
 - AOF and the named queue volume provide persistence, but durability still depends on Redis configuration and the failure type. Host-level redundancy is absent.
 - All save errors currently share the same three-failure policy. A temporary MySQL outage can move otherwise valid events to the failed stream; transient versus permanent error classification remains future work.
 - Publishing to the failed stream, ACKing the original, and clearing its counter are separate commands. A crash between publish and ACK can duplicate the failed-stream record; a crash after ACK can leave a stale counter. The transfer is not atomic.
-- Streams currently retain ACKed entries; no trimming policy, retention limit, or replay tool is implemented. Failed events are stored, not automatically fixed or replayed.
+- Streams currently retain ACKed entries; no trimming policy, retention limit, or replay tool is implemented. A corrected test event was replayed manually; failed events are not automatically fixed or replayed.
 - Recovery depends on workers reaching the claim step and Redis being available. Unique consumer names are required for simultaneously running processes. Graceful shutdown and broader failure/load tests remain follow-up work.
-- Planned extensions include failed-event replay, retention, stronger delivery coordination, a later Kafka migration, and measurement before separating generation and redirect services. Visitor IP/browser/unique-user analytics, POST retry idempotency, and production deployment remain outside the current implementation.
+- Planned extensions include replay tooling, retention, stronger delivery coordination, a later Kafka migration, and measurement before separating generation and redirect services. Visitor IP/browser/unique-user analytics, POST retry idempotency, and production deployment remain outside the current implementation.
+
+
+### Stats API and index verification
+
+GET /links/:code/stats -> getLinkStats(code) -> check links mapping -> return null/404 if absent -> countClicksByCode(code) -> parameterized COUNT(*) -> 200 with shortcode and total_clicks. This route does not call the publisher. An existing link with no click rows returns zero. Event processing is asynchronous, so counts can lag redirects.
+
+| Verified case | Observation |
+| --- | --- |
+| Existing link | NJ75eh returned numeric total_clicks=48 in user output |
+| Repeated stats read | User confirmed no additional click recorded |
+| One short-link request | User confirmed count increased after Event processed |
+| Unknown code | User confirmed 404 |
+| New, unvisited link | User confirmed uEtffX returned zero; requested uEtffx was absent because code matching is case-sensitive |
+
+The user created idx_click_events_shortcode on click_events(shortcode). Before indexing, EXPLAIN showed type=ALL, key=NULL, rows=100, Using where. After indexing, it showed type=ref, key=idx_click_events_shortcode, rows=50, Using index. These row counts are optimizer estimates; they do not establish a measured speedup. Using index indicates a covering index plan. A useful simplified model for this indexed count is O(log N + K), where N is total indexed events and K is matching entries. The count is not a ready-made O(1) hash-map value. The secondary index consumes storage and is maintained during writes.
+
+### Manual failed-event replay verification and milestone closure
+
+The invalid test event in failed entry 1794253704343-0 had an oversized shortcode and three recorded failures. At the user's request, its shortcode was corrected to the existing test link NJ75eh. Application event_id 7164b9e7-b166-4184-a1e0-7b63d2c32097 and occurred_at were preserved, and XADD created new original-stream entry 1794260087201-0. Existing workers processed it. Agent checks confirmed exactly one MySQL row with NJ75eh and UTC time 2026-11-09 19:48:22.186, replay pending=0, no remaining failure counter, and the original failed-stream entry retained. This deliberately added one synthetic click to the link's count. No general replay tool was implemented, and this single replay did not test repeated replay deduplication; duplicate-save behavior was tested separately.
+
+Version 5 closes at background analytics, retries/failed storage, two consumers, idle pending recovery, stats, indexing, and this manual replay verification. Replay tooling, retention, Kafka migration, and the delivery gaps listed above remain separate future work; they are not prerequisites for closing this learning milestone.

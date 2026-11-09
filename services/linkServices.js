@@ -4,6 +4,7 @@ import {
 } from "../repositories/linkRepository.js";
 import redisClient from "../config/redis.js";
 import withTimeout from "../utils/withTimeout.js";
+import { countClicksByCode } from "../repositories/clickRepository.js";
 // Redis fail ho toh is time tak cache skip karenge. 0 ka matlab abhi try kar sakte hain.
 // Yeh time sirf is Node.js process ki memory mein rehta hai.
 let cacheRetryAfter = 0;
@@ -48,7 +49,20 @@ function validateOriginalUrl(value) {
     // Jo URL validate hua hai uska parsed form return karo; wahi database mein save hoga.
     return parsedUrl.href;
 }
+export async function getLinkStats(code) {
+    const originalURL = await findOriginalUrlByCode(code);
 
+    if (originalURL === null) {
+        return null;
+    }
+
+    const total_clicks = await countClicksByCode(code);
+
+    return {
+        shortcode: code,
+        total_clicks
+    };
+}
 // Redis ka wait 500 ms tak karo. Yeh underlying Redis command ko cancel nahi karta.
 
 export async function createShortCode(originalUrl) {

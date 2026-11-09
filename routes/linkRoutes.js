@@ -1,5 +1,5 @@
 import { Router } from "express";
-import {createShortCode, getOGurl} from "../services/linkServices.js";
+import { createShortCode, getLinkStats, getOGurl } from "../services/linkServices.js";
 import { publishClickEvents } from "../queues/clickQueue.js";
 
 const router = Router();
@@ -38,10 +38,10 @@ router.get("/:code", async (req, res) => {
                 error: "Short link not found",
             });
         }
-        try{
+        try {
             await publishClickEvents(req.params.code);
 
-        }catch(err){
+        } catch (err) {
             console.error("Click event publish failed", err.message);
         }
         return res.redirect(302, original_url);
@@ -51,6 +51,27 @@ router.get("/:code", async (req, res) => {
         return res.status(500).json({
             error: "Could not open short link",
         });
+    }
+});
+
+router.get("/links/:code/stats", async (req, res) => {
+    try {
+
+        const stats = await getLinkStats(req.params.code);
+        if (stats === null) {
+            return res.status(404).json({
+                error: "Short link not fount"
+            });
+        }
+
+        return res.status(200).json(stats);
+    } catch (err) {
+
+        console.error("Stats lookup failed:", err.message);
+
+       return  res.status(500).json({
+        err:"Could not fetch the link stats"
+       });
     }
 });
 

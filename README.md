@@ -2,7 +2,7 @@
 
 A learning project built with Node.js, Express, MySQL, and Redis. It creates short links for HTTPS URLs and redirects visitors to the saved destination.
 
-**Current stage: Version 5 core analytics implemented and locally tested - Redis Streams, two workers, retry handling, failed events, and pending-event recovery.** These are learning milestones; the npm package version is still `1.0.0`.
+**Current stage: Version 5 complete for the agreed learning milestone - background click analytics, retries, pending recovery, a stats API, indexed count queries, and a verified manual replay.** These are learning milestones; the npm package version is still `1.0.0`.
 
 ## Version stages
 
@@ -12,7 +12,7 @@ A learning project built with Node.js, Express, MySQL, and Redis. It creates sho
 | Version 2: layered application | Complete | Separate routes, business logic, SQL queries, and connection configuration into modules |
 | Version 3: Redis cache and resilience | Complete | Cache-aside, TTL, MySQL fallback, optional Redis startup, reconnection, 500 ms waiting deadline, five-second cooldown, and queue limit |
 | Version 4: multiple instances and load balancing | Complete | Two host Node.js processes on ports 8000/8001 behind Docker Nginx on 8080; shared MySQL/Redis; distribution, failover, and recovery verified locally |
-| Version 5: background analytics | Implemented; local tests passed | Separate Redis Streams queue, click events, MySQL deduplication, two consumer workers, three-attempt failure handling, failed stream, and idle pending-event recovery |
+| Version 5: background analytics | Complete; local tests passed | Redis Streams analytics, two workers, event-ID deduplication, retries and failed stream, idle pending recovery, stats API, shortcode index, and a manual replay verification |
 | Version 6: evaluate service separation | Planned | Consider independent generation and redirect services based on measured needs |
 
 See [Design.md](Design.md) for design decisions and verified results, and [CACHING.md](CACHING.md) for caching concepts and limitations.
@@ -38,6 +38,7 @@ See [SCALING.md](SCALING.md) for Version 4 concepts, request flow, and failover 
 - Background workers in one consumer group, with MySQL event-ID deduplication and ACK after saving.
 - Three recorded save failures before transfer to a failed-event stream.
 - Recovery of idle pending events through XAUTOCLAIM, using a 60-second idle threshold.
+- A stats API returning the recorded click count, supported by a shortcode index.
 
 ## Current architecture
 
@@ -187,10 +188,17 @@ For a fresh installation, create the click table in `url_shortner`. Skip this SQ
 ```sql
 CREATE TABLE click_events (
     event_id VARCHAR(36) NOT NULL,
-    shortcode VARCHAR(36) NOT NULL,
+    shortcode VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     occurred_at DATETIME(3) NOT NULL,
-    PRIMARY KEY (event_id)
+    PRIMARY KEY (event_id),
+    KEY idx_click_events_shortcode (shortcode)
 );
+```
+
+For an existing click table, check `SHOW INDEX FROM click_events` first. If the shortcode index is missing, the migration used in this milestone is:
+
+```sql
+CREATE INDEX idx_click_events_shortcode ON click_events (shortcode);
 ```
 
 Create the queue container once, with AOF and a named data volume:
@@ -266,6 +274,21 @@ Example: `GET /abc123`.
 | 500 | Database lookup failed. |
 
 `/health` is a reserved route. The application server must be running for short links to redirect.
+
+### Read recorded click statistics
+
+`GET /links/:code/stats`
+
+```json
+{
+  "shortcode": "NJ75eh",
+  "total_clicks": 48
+}
+```
+
+The example count is illustrative. Existing links return 200 with a numeric count, including zero for a link with no recorded clicks. Unknown codes return 404; database errors return 500. Codes are case-sensitive. Stats requests do not publish click events. Because analytics is processed in the background, the latest click can appear after a delay; the count represents saved events, not guaranteed unique visitors or every attempted redirect.
+
+The service first checks the link mapping, then counts matching click_events rows using a parameterized query. The B-tree index on shortcode supports that query; the count still examines matching index entries and is not a precomputed constant-time total.
 
 ## Request flows
 
@@ -343,12 +366,26 @@ Each click gets a new application `event_id` UUID. Retries reuse that UUID; the 
 
 See [Design.md](Design.md) for the worker decision flow, the manually created recovery fixture, and remaining delivery limitations. These checks are local observations; automated coverage is still limited.
 
+### Stats, indexing, and manual replay results
+
+| Check | Verified result |
+| --- | --- |
+| Existing link stats | User received NJ75eh with numeric total_clicks=48 |
+| Repeated stats read, then one redirect | User confirmed stable count for stats-only reads and an increment after worker processing |
+| Unknown code | User confirmed 404 |
+| New unvisited link | User confirmed total_clicks=0 for uEtffX; lowercase uEtffx correctly returned 404 |
+| EXPLAIN before index | ALL, key=NULL, estimated rows=100, Using where |
+| EXPLAIN after index | ref, idx_click_events_shortcode, estimated rows=50, Using index |
+| Manual replay of corrected failed test event | Original UUID and timestamp preserved; worker saved one MySQL row and ACKed; replay pending=0, counter cleared, failed-stream original retained |
+
+The EXPLAIN estimates do not prove a 2x speedup. The manual replay deliberately corrected an invalid test event to NJ75eh and added one synthetic click to that link's recorded count. No automatic replay service or general replay command was added.
+
 ## Current limits and future work
 
 This is a local learning setup with two application processes, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. Application-process failover is verified, but a machine failure still stops the entire setup. `localhost` links are not public shareable links.
 
 The waiting deadline does not cancel underlying Redis commands. Cooldown state is per application process; simultaneous misses are not coalesced. Cache outages transfer traffic to MySQL. The queue limit is not an HTTP rate limit, and there is no overall HTTP request deadline.
 
-Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. Follow-up work includes failed-event replay, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
+Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. The agreed Version 5 milestone is closed. Follow-up work includes replay tooling, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
 
 Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
