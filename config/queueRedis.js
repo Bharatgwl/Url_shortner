@@ -6,7 +6,7 @@ const queueClient = createClient({
     commandsQueueMaxLength:100,
 });
 queueClient.on("ready", ()=>{
-    console.log("Queue redis ready");
+    console.log("Redis Queue ready");
 })
 
 queueClient.on("error",(error)=>{

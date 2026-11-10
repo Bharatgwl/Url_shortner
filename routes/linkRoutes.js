@@ -69,9 +69,9 @@ router.get("/links/:code/stats", async (req, res) => {
 
         console.error("Stats lookup failed:", err.message);
 
-       return  res.status(500).json({
-        err:"Could not fetch the link stats"
-       });
+        return res.status(500).json({
+            err: "Could not fetch the link stats"
+        });
     }
 });
 

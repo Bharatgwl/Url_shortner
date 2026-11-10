@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import pool from "./config/db.js";
-import saveClickEvent from "./repositories/clickRepository.js";
+import pool from "../config/db.js";
+import saveClickEvent from "../repositories/clickRepository.js";
 
 const event = {
     event_id: randomUUID(),

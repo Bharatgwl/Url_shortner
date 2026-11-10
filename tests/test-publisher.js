@@ -1,5 +1,5 @@
-import queueClient from "./config/queueRedis.js";
-import { publishClickEvents } from "./queues/clickQueue.js";
+import queueClient from "../config/queueRedis.js";
+import { publishClickEvents } from "../queues/clickQueue.js";
 
 try {
     await queueClient.connect();

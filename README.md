@@ -2,7 +2,7 @@
 
 A learning project built with Node.js, Express, MySQL, and Redis. It creates short links for HTTPS URLs and redirects visitors to the saved destination.
 
-**Current stage: Version 5 complete for the agreed learning milestone - background click analytics, retries, pending recovery, a stats API, indexed count queries, and a verified manual replay.** These are learning milestones; the npm package version is still `1.0.0`.
+**Current stage: Version 6 complete for the agreed learning milestone - creation and redirect services run separately, with Nginx path routing and independent failure/recovery verified locally.** These are learning milestones; the npm package version is still `1.0.0`.
 
 ## Version stages
 
@@ -13,7 +13,7 @@ A learning project built with Node.js, Express, MySQL, and Redis. It creates sho
 | Version 3: Redis cache and resilience | Complete | Cache-aside, TTL, MySQL fallback, optional Redis startup, reconnection, 500 ms waiting deadline, five-second cooldown, and queue limit |
 | Version 4: multiple instances and load balancing | Complete | Two host Node.js processes on ports 8000/8001 behind Docker Nginx on 8080; shared MySQL/Redis; distribution, failover, and recovery verified locally |
 | Version 5: background analytics | Complete; local tests passed | Redis Streams analytics, two workers, event-ID deduplication, retries and failed stream, idle pending recovery, stats API, shortcode index, and a manual replay verification |
-| Version 6: evaluate service separation | Planned | Consider independent generation and redirect services based on measured needs |
+| Version 6: creation/redirect separation | Complete; local tests passed | Creation on 8000, redirects/stats on 8001, Nginx path routing on 8080, and independent failure/recovery checks |
 
 See [Design.md](Design.md) for design decisions and verified results, and [CACHING.md](CACHING.md) for caching concepts and limitations.
 
@@ -39,21 +39,26 @@ See [SCALING.md](SCALING.md) for Version 4 concepts, request flow, and failover 
 - Three recorded save failures before transfer to a failed-event stream.
 - Recovery of idle pending events through XAUTOCLAIM, using a 60-second idle threshold.
 - A stats API returning the recorded click count, supported by a shortcode index.
+- Separate creation and redirect processes, selected by Nginx request-path routing.
 
 ## Current architecture
 
-Nginx in Docker exposes one local entry point at `http://localhost:8080` and distributes requests across two Node.js processes on host ports 8000 and 8001. Both use the same local MySQL database, Docker Redis cache, and a separate Docker Redis queue. Two independent Node.js worker processes consume click events into MySQL.
+Nginx in Docker exposes `http://localhost:8080`. The exact path `/links` goes to the creation service on host port 8000; other paths go to the redirect service on 8001, including `/links/:code/stats`. Both services use the same MySQL database. The redirect service also connects to cache Redis and queue Redis; analytics workers consume queue events into MySQL.
 
 ```text
-Client -> Nginx :8080 -> App :8000 or App :8001
-                         Both -> shared Redis cache
-                         Both -> shared MySQL database
-                         Both -> Redis queue :6380 -> worker-1 / worker-2 -> MySQL click_events
+Client -> Nginx :8080
+            /links       -> Creation :8000 -> MySQL links
+            other paths  -> Redirect :8001 -> Redis cache / MySQL links
+                                stats     -> MySQL click_events
+                                clicks    -> Redis queue :6380
+                                             -> worker-1 / worker-2 -> MySQL click_events
 ```
 
 ```text
-server.js
-routes/linkRoutes.js
+creationServer.js
+redirectServer.js
+routes/creationRoutes.js
+routes/redirectRoutes.js
 services/linkServices.js
 repositories/linkRepository.js
 config/db.js
@@ -68,7 +73,7 @@ utils/withTimeout.js
 nginx/nginx.conf
 ```
 
-These are two instances of the same application, not separate generation and redirect microservices. All components still run on one computer.
+These are two services with different route responsibilities. They share one repository, service modules, and MySQL database; all components still run on one computer. `server.js` and `routes/linkRoutes.js` remain as the older combined entry point and router. V6 startup uses the two new entry points below.
 
 ## Requirements
 
@@ -120,7 +125,7 @@ REDIS_URL=redis://127.0.0.1:6379
 QUEUE_REDIS_URL=redis://127.0.0.1:6380
 ```
 
-Use no trailing slash in `BASE_URL`. It controls returned links, not the listening port. Set `PORT` separately in each terminal as shown below. The current code defaults to port `8888` if `PORT` is absent; the Nginx setup requires explicitly using 8000 and 8001.
+Use no trailing slash in `BASE_URL`. It controls returned links, not the listening port. Set `PORT` separately in each terminal as shown below. Creation defaults to 8000 and redirect defaults to 8001; an existing PORT environment variable overrides either default. The legacy combined server.js defaults to 8888.
 
 Keep `.env` and `node_modules/` in `.gitignore`. Never commit actual credentials.
 
@@ -141,29 +146,29 @@ docker start url-shortener-redis
 
 The port binding exposes cache Redis only on the local machine. Cache data is disposable; MySQL remains the source of truth for URL mappings.
 
-### 5. Start both application instances
+### 5. Start the creation and redirect services
 
 From the project root, open two PowerShell terminals. In terminal 1:
 
 ```powershell
 $env:PORT="8000"
-node server.js
+node creationServer.js
 ```
 
 In terminal 2:
 
 ```powershell
 $env:PORT="8001"
-node server.js
+node redirectServer.js
 ```
 
-Each terminal must show its assigned listening port. `node server.js` does not reload edits automatically; restart both processes after code or environment-file changes. Alternatively, `npm run dev` uses globally installed nodemon with the PORT assigned in that terminal.
+Each terminal must show its service name and assigned port. Node does not reload edits automatically; restart the affected process after source edits. With globally installed nodemon, use `nodemon creationServer.js` or `nodemon redirectServer.js` in the corresponding terminal. The existing `npm run dev` script still starts the legacy combined server.js; it is not the V6 startup command.
 
-The server checks MySQL before listening. Redis connects in the background, so its ready message may appear before or after the listening message:
+Each service checks MySQL before listening. Only the redirect entry point connects cache and queue Redis in the background, so Redis ready messages may appear before or after its listening message. For example:
 
 ```text
 Database connected
-Server listening on 8000
+Redirect Server listening on 8001
 Redis ready: caching available
 ```
 
@@ -179,7 +184,9 @@ docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind
 
 For later runs, use `docker start url-shortener-nginx`. Nginx reaches the host applications through `host.docker.internal:8000` and `:8001`. The mounted config is `nginx/nginx.conf`.
 
-Check `http://localhost:8080/health` and send application requests through port 8080. Both Node.js terminals log their handled requests. Direct ports 8000/8001 are for local checks; generated links use 8080.
+Check each service directly at `http://localhost:8000/health` and `http://localhost:8001/health`. Through 8080, `/health` is routed only to the redirect service; it does not represent both services. Both terminals log handled requests. Generated links continue to use 8080.
+
+The mounted config has separate creation_service and redirect_service upstreams. `location = /links` matches the exact path; `location /` forwards remaining paths to redirect. It is path routing, not round-robin between different service roles. Each service's Express router handles HTTP methods. `/links/` does not match the exact creation location; use the documented `/links` path. After editing the config, validate with `docker exec url-shortener-nginx nginx -t` and, on success, apply it with `docker exec url-shortener-nginx nginx -s reload`.
 
 ### 7. Set up the analytics queue and workers
 
@@ -380,12 +387,26 @@ See [Design.md](Design.md) for the worker decision flow, the manually created re
 
 The EXPLAIN estimates do not prove a 2x speedup. The manual replay deliberately corrected an invalid test event to NJ75eh and added one synthetic click to that link's recorded count. No automatic replay service or general replay command was added.
 
+### Version 6: verified routing and service failures
+
+| Scenario | Expected and observed result | Evidence |
+| --- | --- | --- |
+| Direct health checks | Both 8000 and 8001 returned 200 | User pasted HTTP output |
+| Direct creation and redirect | Creation POST returned 201; saved code redirected through 8001 with 302 | User confirmation and pasted redirect response |
+| Route ownership | GET of a valid code on creation returned 404; POST /links on redirect returned 404; stats worked on redirect | User checks and confirmation |
+| Full flow through Nginx | POST on 8080 reached creation; stats returned zero; redirect returned 302; worker processing increased recorded count | User confirmation |
+| Creation stopped | Existing redirect stayed 302; creation POST returned 502; creation returned 201 after restart | User confirmation of the guided test |
+| Redirect stopped | Creation POST stayed 201; redirects/stats returned 502; they recovered after redirect restarted | User confirmation of the guided test |
+| Restart response clarification | Agent independently observed 302 through 8080 and directly on 8001, plus 200 stats | Curl requests without following redirects; the user's 403 was likely from the destination after redirect following |
+
+Each role currently has one instance. These tests demonstrate independence of the HTTP service roles; they do not demonstrate replacement-instance failover or higher throughput. A real destination may reject the client after a successful shortener redirect. Verify the shortener's status without following redirects.
+
 ## Current limits and future work
 
-This is a local learning setup with two application processes, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. Application-process failover is verified, but a machine failure still stops the entire setup. `localhost` links are not public shareable links.
+This is a local learning setup with one creation process, one redirect process, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. A stopped role returns 502 for its routed requests; the other role can continue when shared dependencies are healthy. A machine failure still stops the entire setup. `localhost` links are not public shareable links.
 
 The waiting deadline does not cancel underlying Redis commands. Cooldown state is per application process; simultaneous misses are not coalesced. Cache outages transfer traffic to MySQL. The queue limit is not an HTTP rate limit, and there is no overall HTTP request deadline.
 
-Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. The agreed Version 5 milestone is closed. Follow-up work includes replay tooling, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
+Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. Version 5 and the agreed Version 6 service-separation milestone are closed. Follow-up work includes replay tooling, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
 
 Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.

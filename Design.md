@@ -2,7 +2,7 @@
 
 ## Version stages and current status
 
-**Current stage: Version 5 complete for the agreed learning milestone, including analytics workers, recovery, a stats API, indexed counts, and a verified manual replay.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
+**Current stage: Version 6 complete for the agreed learning milestone: separate creation/redirect entry points, Nginx path routing, and independent failure/recovery checks.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
 
 | Stage | Status | Implementation | Validation |
 | --- | --- | --- | --- |
@@ -11,11 +11,11 @@
 | Version 3: Redis cache and resilience | Complete | Redis in Docker; cache-aside reads; 300-second TTL; MySQL fallback; background connection and reconnection; 500 ms application waiting deadline; five-second cooldown; queue limit 100; offline queue disabled | Cache GET/TTL; hits and misses; stopped and stalled Redis; startup without Redis; reconnection; cooldown and recovery; queue saturation and 120 concurrent HTTP requests |
 | Version 4: multiple application instances | Complete | PORT configuration; two host Node.js instances on 8000/8001; shared MySQL/Redis; Docker Nginx on 8080; BASE_URL set to the common address | Cross-instance link access; round-robin logs; GET and POST with 8001 unavailable; redirect and recovery verified |
 | Version 5: background analytics | Complete; local tests passed | Separate Redis Streams queue; bounded publishing; MySQL deduplication; two consumers; retries and failed stream; XAUTOCLAIM recovery; stats endpoint and shortcode index | Publish/save/ACK; duplicates; queue and worker recovery; three-failure handling; two consumers; stats cases; EXPLAIN comparison; corrected manual replay |
-| Version 6: evaluate service separation | Planned | Consider separate URL-generation and redirect services when justified by measured needs | Define requirements and measure before splitting |
+| Version 6: creation/redirect separation | Complete; local tests passed | Creation server on 8000; redirect/stats server on 8001; separate routers; Nginx exact-path and fallback routing | Direct route ownership, full flow through 8080, independent service failures, recovery, and agent no-follow HTTP checks |
 
 Version 1 queried MySQL directly for redirects. Version 2 changed code organization while retaining one process. Version 3 added the external cache and cache-failure handling. The sections below describe the latest implementation.
 
-Two application processes, two analytics worker processes, and MySQL run locally. Separate cache Redis and queue Redis containers, plus Nginx, run in Docker. Nginx distributes HTTP requests to the host applications; workers consume analytics independently. Generation and redirect logic remain in the same application.
+Creation and redirect run as separate Node.js processes, alongside analytics workers and MySQL on the host. Cache Redis, queue Redis, and Nginx run in Docker. Nginx routes requests by path to the appropriate service role; workers consume analytics independently. Shared business/repository modules and the database remain in one repository and deployment environment.
 
 ## Requirements
 
@@ -30,13 +30,16 @@ Two application processes, two analytics worker processes, and MySQL run locally
 
 | Component | Responsibility |
 | --- | --- |
-| server.js | Initialize the application, check MySQL, connect cache and queue Redis in the background, and listen for HTTP requests |
-| routes/linkRoutes.js | Read requests and send HTTP responses |
+| creationServer.js | Check MySQL, mount creation routes, expose health, and listen on 8000 by default |
+| redirectServer.js | Check MySQL, connect cache/queue Redis in the background, mount redirect/stats routes, and listen on 8001 by default |
+| routes/creationRoutes.js | POST /links validation/creation HTTP responses |
+| routes/redirectRoutes.js | GET /:code publication/redirect and GET /links/:code/stats HTTP responses |
+| server.js and routes/linkRoutes.js | Legacy combined entry point/router retained from earlier versions |
 | services/linkServices.js | Validate URLs, generate codes, retry collisions, and manage cache-aside lookups and fallback |
 | repositories/linkRepository.js | Execute parameterized SQL queries |
 | config/db.js | Configure the MySQL connection pool |
 | config/redis.js | Configure the Redis client, queue limit, and connection events |
-| nginx/nginx.conf | Reverse proxy and round-robin upstream group for ports 8000/8001 |
+| nginx/nginx.conf | Reverse proxy; exact /links to creation:8000, other paths to redirect:8001 |
 | config/queueRedis.js | Separate Redis queue connection on port 6380, offline queue disabled and command queue capped at 100 |
 | queues/clickQueue.js | Generate a click UUID and UTC timestamp, then publish through bounded XADD |
 | repositories/clickRepository.js | Parameterized click insert, duplicate event-ID handling, and shortcode-filtered count query |
@@ -94,6 +97,8 @@ Generate a candidate, attempt insertion, and retry ER_DUP_ENTRY up to five total
 - [x] Idle pending-event recovery through XAUTOCLAIM
 - [x] Stats API, zero-click and unknown-code handling, and shortcode count index
 - [x] Manual corrected failed-event replay verified; automatic tooling remains deferred
+- [x] Separate creation and redirect entry points and routers
+- [x] Nginx path routing and independent service failure/recovery checks
 
 ## Version 3: verified results
 
@@ -117,7 +122,7 @@ Tests used http://localhost:8000/qH6jEB. HTTP clients did not follow redirects. 
 | Queue saturation: isolated service test | Actual service imported in a separate process; Redis paused; 120 simultaneous lookups; limit 100 | 20 queue-full errors, 100 waiting timeouts; all 120 returned a URL; approximately 517 ms for the batch | Queue rejection and timeout both fell back to MySQL |
 | Queue saturation: live HTTP test | Redis paused; 120 concurrent requests | 120 responses with status 302 | Live HTTP requests survived the test; Redis unpaused afterward |
 
-## Version 4: load balancing and verified results
+## Version 4: historical load balancing and verified results
 
 Public local entry point: `http://localhost:8080`. Nginx listens on container port 80 and forwards to `host.docker.internal:8000` or `:8001`. Both application instances use the same database and Redis, while each has its own connection pool and in-memory cache cooldown.
 
@@ -244,3 +249,40 @@ The user created idx_click_events_shortcode on click_events(shortcode). Before i
 The invalid test event in failed entry 1794253704343-0 had an oversized shortcode and three recorded failures. At the user's request, its shortcode was corrected to the existing test link NJ75eh. Application event_id 7164b9e7-b166-4184-a1e0-7b63d2c32097 and occurred_at were preserved, and XADD created new original-stream entry 1794260087201-0. Existing workers processed it. Agent checks confirmed exactly one MySQL row with NJ75eh and UTC time 2026-11-09 19:48:22.186, replay pending=0, no remaining failure counter, and the original failed-stream entry retained. This deliberately added one synthetic click to the link's count. No general replay tool was implemented, and this single replay did not test repeated replay deduplication; duplicate-save behavior was tested separately.
 
 Version 5 closes at background analytics, retries/failed storage, two consumers, idle pending recovery, stats, indexing, and this manual replay verification. Replay tooling, retention, Kafka migration, and the delivery gaps listed above remain separate future work; they are not prerequisites for closing this learning milestone.
+
+
+## Version 6: creation and redirect service separation
+
+### Scope and route ownership
+
+The learning objective was to separate HTTP responsibilities and test independent process failures. This split is an architecture exercise; no traffic measurements established a production need for independently deployed services. Each service currently has one instance, and both share the same repository, business/repository modules, and MySQL database.
+
+| Service | Entry point | Host port | Routes | Runtime connections |
+| --- | --- | --- | --- | --- |
+| Creation | creationServer.js | 8000 | POST /links; GET /health | MySQL |
+| Redirect | redirectServer.js | 8001 | GET /:code; GET /links/:code/stats; GET /health | MySQL, cache Redis, queue Redis |
+
+Nginx container port 80 is published at host 127.0.0.1:8080. The project's nginx/nginx.conf is bind-mounted read-only at /etc/nginx/nginx.conf. `host.docker.internal` reaches the host service ports from the container. Nginx runs independently of Node.js and reads config at startup/reload. User applied the new config after syntax validation and reload.
+
+The exact location `= /links` forwards to creation_service. The fallback `/` forwards to redirect_service, including stats paths. Matching is by path; Express routes select supported HTTP methods. A missing `=` would send stats paths to creation and return 404. The `/links/` trailing-slash path uses the fallback, so clients should use the documented `/links`. Public `/health` checks redirect only; inspect both direct health endpoints to check both processes.
+
+### Verified local results
+
+| Scenario | Result | Evidence source |
+| --- | --- | --- |
+| Health | Both direct service health endpoints returned 200 | User HTTP output |
+| Direct creation/redirect | POST on creation returned 201; valid code on redirect returned 302 | User confirmation and pasted HTTP response |
+| Wrong service | GET of valid code on creation and POST /links on redirect returned 404 | User checks and confirmation |
+| Stats | Direct stats on redirect returned 200 | User confirmation |
+| Nginx routing | POST reached 8000; redirects/stats reached 8001; new-link count went from zero to one after processing | User confirmation of guided test |
+| Creation unavailable | POST returned 502 while existing redirect returned 302; POST recovered to 201 after restart | User confirmation of guided test |
+| Redirect unavailable | Creation stayed 201; redirect/stats requests failed with 502; recovered after restart | User confirmation of guided test |
+| Redirect recovery checked independently | Agent observed 302 through 8080, 302 directly on 8001, and stats 200 for OPB0SQ | Curl without redirect following |
+
+The user's client displayed 403 after restart. Agent checks verified that the shortener returned 302 to LeetCode; the 403 likely came from the destination after the client followed the redirect. The external 403 source was not independently verified. Those two agent redirect checks also generated normal test click events.
+
+### Closure and remaining limits
+
+The agreed V6 finish line is reached: separate entry points/routers, Nginx role routing, direct and common-entry HTTP checks, independent failure/recovery tests, and updated docs. V4's interchangeable-instance round robin is historical; V6's two processes have different roles and cannot substitute for each other. Multiple instances per role, throughput measurement, graceful shutdown, Kafka, authentication, and deployment remain future work.
+
+MySQL and the host remain shared failure points. Worker/cache/queue delivery limits from V5 still apply. The existing npm dev script and package main still refer to legacy server.js; use the documented creationServer.js and redirectServer.js commands for V6. No package scripts, ports, credentials, environment files, or service settings were changed by the documentation update.
