@@ -2,7 +2,7 @@
 
 ## Version stages and current status
 
-**Current stage: Version 6 complete for the agreed learning milestone: separate creation/redirect entry points, Nginx path routing, and independent failure/recovery checks.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
+**Current stage: Version 7 complete for the agreed learning milestone: two replicas per HTTP role, per-role round robin, and local single-instance failover/recovery.** Version labels describe learning milestones, not npm releases; package.json remains at 1.0.0.
 
 | Stage | Status | Implementation | Validation |
 | --- | --- | --- | --- |
@@ -12,10 +12,11 @@
 | Version 4: multiple application instances | Complete | PORT configuration; two host Node.js instances on 8000/8001; shared MySQL/Redis; Docker Nginx on 8080; BASE_URL set to the common address | Cross-instance link access; round-robin logs; GET and POST with 8001 unavailable; redirect and recovery verified |
 | Version 5: background analytics | Complete; local tests passed | Separate Redis Streams queue; bounded publishing; MySQL deduplication; two consumers; retries and failed stream; XAUTOCLAIM recovery; stats endpoint and shortcode index | Publish/save/ACK; duplicates; queue and worker recovery; three-failure handling; two consumers; stats cases; EXPLAIN comparison; corrected manual replay |
 | Version 6: creation/redirect separation | Complete; local tests passed | Creation server on 8000; redirect/stats server on 8001; separate routers; Nginx exact-path and fallback routing | Direct route ownership, full flow through 8080, independent service failures, recovery, and agent no-follow HTTP checks |
+| Version 7: service replicas and failover | Complete; local tests passed | Creation 8000/8002; redirect 8001/8003; round robin within each role and default passive failover | User-confirmed health, request distribution, stopped-instance continuity, and recovery in both roles |
 
 Version 1 queried MySQL directly for redirects. Version 2 changed code organization while retaining one process. Version 3 added the external cache and cache-failure handling. The sections below describe the latest implementation.
 
-Creation and redirect run as separate Node.js processes, alongside analytics workers and MySQL on the host. Cache Redis, queue Redis, and Nginx run in Docker. Nginx routes requests by path to the appropriate service role; workers consume analytics independently. Shared business/repository modules and the database remain in one repository and deployment environment.
+Creation and redirect each run as two separate Node.js processes, alongside analytics workers and MySQL on the host. Cache Redis, queue Redis, and Nginx run in Docker. Nginx routes requests by path to the appropriate service role; workers consume analytics independently. Shared business/repository modules and the database remain in one repository and deployment environment.
 
 ## Requirements
 
@@ -39,7 +40,7 @@ Creation and redirect run as separate Node.js processes, alongside analytics wor
 | repositories/linkRepository.js | Execute parameterized SQL queries |
 | config/db.js | Configure the MySQL connection pool |
 | config/redis.js | Configure the Redis client, queue limit, and connection events |
-| nginx/nginx.conf | Reverse proxy; exact /links to creation:8000, other paths to redirect:8001 |
+| nginx/nginx.conf | Exact /links to creation group 8000/8002; other paths to redirect group 8001/8003; per-role round robin and passive failover |
 | config/queueRedis.js | Separate Redis queue connection on port 6380, offline queue disabled and command queue capped at 100 |
 | queues/clickQueue.js | Generate a click UUID and UTC timestamp, then publish through bounded XADD |
 | repositories/clickRepository.js | Parameterized click insert, duplicate event-ID handling, and shortcode-filtered count query |
@@ -99,6 +100,7 @@ Generate a candidate, attempt insertion, and retry ER_DUP_ENTRY up to five total
 - [x] Manual corrected failed-event replay verified; automatic tooling remains deferred
 - [x] Separate creation and redirect entry points and routers
 - [x] Nginx path routing and independent service failure/recovery checks
+- [x] Two HTTP replicas per role, per-role distribution, single-instance failover, and recovery
 
 ## Version 3: verified results
 
@@ -251,7 +253,7 @@ The invalid test event in failed entry 1794253704343-0 had an oversized shortcod
 Version 5 closes at background analytics, retries/failed storage, two consumers, idle pending recovery, stats, indexing, and this manual replay verification. Replay tooling, retention, Kafka migration, and the delivery gaps listed above remain separate future work; they are not prerequisites for closing this learning milestone.
 
 
-## Version 6: creation and redirect service separation
+## Version 6: historical creation and redirect service separation
 
 ### Scope and route ownership
 
@@ -283,6 +285,45 @@ The user's client displayed 403 after restart. Agent checks verified that the sh
 
 ### Closure and remaining limits
 
-The agreed V6 finish line is reached: separate entry points/routers, Nginx role routing, direct and common-entry HTTP checks, independent failure/recovery tests, and updated docs. V4's interchangeable-instance round robin is historical; V6's two processes have different roles and cannot substitute for each other. Multiple instances per role, throughput measurement, graceful shutdown, Kafka, authentication, and deployment remain future work.
+The agreed V6 finish line is reached: separate entry points/routers, Nginx role routing, direct and common-entry HTTP checks, independent failure/recovery tests, and updated docs. V4's interchangeable-instance round robin is historical; V6's two processes have different roles and cannot substitute for each other. Version 7 adds multiple instances per role. Throughput measurement, graceful shutdown, Kafka, authentication, and deployment remain future work.
 
 MySQL and the host remain shared failure points. Worker/cache/queue delivery limits from V5 still apply. The existing npm dev script and package main still refer to legacy server.js; use the documented creationServer.js and redirectServer.js commands for V6. No package scripts, ports, credentials, environment files, or service settings were changed by the documentation update.
+
+
+## Version 7: per-role replicas and failover
+
+### Scope and architecture
+
+The same creationServer.js file runs twice, on 8000 and 8002. The same redirectServer.js file runs twice, on 8001 and 8003. Each invocation is an independent Node.js process with PORT explicitly assigned in its terminal. No new HTTP service implementation was required. All use the existing repository modules and shared MySQL; the two redirect instances also connect to shared cache Redis and queue Redis. Analytics workers remain separate processes.
+
+```text
+Client -> Nginx :8080
+  exact /links -> creation_service -> :8000 or :8002
+  other paths -> redirect_service -> :8001 or :8003
+```
+
+Each upstream uses default round robin. One role's instances can substitute for each other; creation cannot substitute for redirect or vice versa. The exact /links routing rule and stats/public-health ownership remain as documented in V6. Each Node.js process has its own connection pools and module state, including each redirect process's cache cooldown; Redis mappings and MySQL rows are shared.
+
+### Passive failure handling and recovery
+
+Nginx learns upstream failures from actual requests. With the unchanged defaults max_fails=1 and fail_timeout=10s, a failed peer can be temporarily excluded and tried again by live traffic after the interval. The recovery exercise waited 10-15 seconds after process restart and sent more requests. No active periodic application health checks, custom proxy timeouts, or external process supervisor were added. Reference: [Nginx HTTP load balancing](https://nginx.org/en/docs/http/load_balancing.html).
+
+Tests stopped a process before sending requests, producing a connection-refusal scenario. Successful POST failover here does not prove safe replay after a POST was partly processed. Creation still generates a fresh link for every accepted submission; no POST idempotency key exists. Different failures, such as a connected but stalled process, can have different timeout behavior.
+
+### Verified local results
+
+| Scenario | Result | Evidence source |
+| --- | --- | --- |
+| Added-instance health | 8002 and 8003 returned 200; existing 8000/8001 instances remained running | User confirmation of guided setup |
+| Creation round robin | Four POST requests returned 201; both 8000 and 8002 logged requests | User confirmation |
+| Redirect round robin | Four requests returned 302; both 8001 and 8003 logged requests | User confirmation |
+| Creation 8000 stopped | Four POST requests returned 201 through 8002 | User confirmation of guided test |
+| Creation 8000 recovered | After restart and wait, both creation instances logged requests again | User confirmation |
+| Redirect 8001 stopped | Four short-link requests returned 302 through 8003; stats returned 200 | User confirmation of guided test |
+| Redirect 8001 recovered | After restart and wait, both redirect instances logged requests again | User confirmation |
+
+These V7 runtime results are user-reported confirmations of the guided tests; the agent inspected the four-server config and recorded them without repeating the outage tests. No concurrency benchmark, p95 latency comparison, machine outage, or complete service-group outage was tested in this milestone.
+
+### Milestone closure
+
+V7 closes at two HTTP replicas per role, Nginx per-role round robin, single-instance failover, recovery, and documentation. This is local process redundancy, with all components on one machine. Nginx, MySQL, and the host remain shared failure points. Queue/cache delivery limitations, stream retention, replay tooling, broader performance testing, graceful shutdown, Kafka, and deployment remain separate future work.

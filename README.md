@@ -2,7 +2,7 @@
 
 A learning project built with Node.js, Express, MySQL, and Redis. It creates short links for HTTPS URLs and redirects visitors to the saved destination.
 
-**Current stage: Version 6 complete for the agreed learning milestone - creation and redirect services run separately, with Nginx path routing and independent failure/recovery verified locally.** These are learning milestones; the npm package version is still `1.0.0`.
+**Current stage: Version 7 complete for the agreed learning milestone - two creation instances and two redirect instances, with per-role round robin, single-instance failover, and recovery verified locally.** These are learning milestones; the npm package version is still `1.0.0`.
 
 ## Version stages
 
@@ -14,6 +14,7 @@ A learning project built with Node.js, Express, MySQL, and Redis. It creates sho
 | Version 4: multiple instances and load balancing | Complete | Two host Node.js processes on ports 8000/8001 behind Docker Nginx on 8080; shared MySQL/Redis; distribution, failover, and recovery verified locally |
 | Version 5: background analytics | Complete; local tests passed | Redis Streams analytics, two workers, event-ID deduplication, retries and failed stream, idle pending recovery, stats API, shortcode index, and a manual replay verification |
 | Version 6: creation/redirect separation | Complete; local tests passed | Creation on 8000, redirects/stats on 8001, Nginx path routing on 8080, and independent failure/recovery checks |
+| Version 7: service replicas and failover | Complete; local tests passed | Creation on 8000/8002, redirect on 8001/8003; round robin within each role; one-instance outages and recovery verified |
 
 See [Design.md](Design.md) for design decisions and verified results, and [CACHING.md](CACHING.md) for caching concepts and limitations.
 
@@ -40,15 +41,16 @@ See [SCALING.md](SCALING.md) for Version 4 concepts, request flow, and failover 
 - Recovery of idle pending events through XAUTOCLAIM, using a 60-second idle threshold.
 - A stats API returning the recorded click count, supported by a shortcode index.
 - Separate creation and redirect processes, selected by Nginx request-path routing.
+- Two instances per role, with per-role round robin and passive failover.
 
 ## Current architecture
 
-Nginx in Docker exposes `http://localhost:8080`. The exact path `/links` goes to the creation service on host port 8000; other paths go to the redirect service on 8001, including `/links/:code/stats`. Both services use the same MySQL database. The redirect service also connects to cache Redis and queue Redis; analytics workers consume queue events into MySQL.
+Nginx in Docker exposes `http://localhost:8080`. The exact path `/links` goes to the creation group on host ports 8000/8002; other paths go to the redirect group on 8001/8003, including `/links/:code/stats`. Nginx distributes requests within each group using default round robin. Both services use the same MySQL database. The redirect service also connects to cache Redis and queue Redis; analytics workers consume queue events into MySQL.
 
 ```text
 Client -> Nginx :8080
-            /links       -> Creation :8000 -> MySQL links
-            other paths  -> Redirect :8001 -> Redis cache / MySQL links
+            /links       -> Creation :8000 / :8002 -> MySQL links
+            other paths  -> Redirect :8001 / :8003 -> Redis cache / MySQL links
                                 stats     -> MySQL click_events
                                 clicks    -> Redis queue :6380
                                              -> worker-1 / worker-2 -> MySQL click_events
@@ -73,7 +75,7 @@ utils/withTimeout.js
 nginx/nginx.conf
 ```
 
-These are two services with different route responsibilities. They share one repository, service modules, and MySQL database; all components still run on one computer. `server.js` and `routes/linkRoutes.js` remain as the older combined entry point and router. V6 startup uses the two new entry points below.
+These are two service roles, each running in two independent Node.js processes. They share one repository, service modules, and MySQL database; all components still run on one computer. `server.js` and `routes/linkRoutes.js` remain as the older combined entry point and router. V6 and V7 startup use the two new entry points below; V7 runs each one twice on different ports.
 
 ## Requirements
 
@@ -146,9 +148,9 @@ docker start url-shortener-redis
 
 The port binding exposes cache Redis only on the local machine. Cache data is disposable; MySQL remains the source of truth for URL mappings.
 
-### 5. Start the creation and redirect services
+### 5. Start two instances of each service
 
-From the project root, open two PowerShell terminals. In terminal 1:
+From the project root, open four PowerShell terminals. In terminal 1:
 
 ```powershell
 $env:PORT="8000"
@@ -162,7 +164,21 @@ $env:PORT="8001"
 node redirectServer.js
 ```
 
-Each terminal must show its service name and assigned port. Node does not reload edits automatically; restart the affected process after source edits. With globally installed nodemon, use `nodemon creationServer.js` or `nodemon redirectServer.js` in the corresponding terminal. The existing `npm run dev` script still starts the legacy combined server.js; it is not the V6 startup command.
+In terminal 3, start the second creation instance:
+
+```powershell
+$env:PORT="8002"
+node creationServer.js
+```
+
+In terminal 4, start the second redirect instance:
+
+```powershell
+$env:PORT="8003"
+node redirectServer.js
+```
+
+Each terminal must show its service name and assigned port. Node does not reload edits automatically; restart the affected process after source edits. With globally installed nodemon, use `nodemon creationServer.js` or `nodemon redirectServer.js` in the corresponding terminal. The existing `npm run dev` script still starts the legacy combined server.js; it is not the V6/V7 startup command.
 
 Each service checks MySQL before listening. Only the redirect entry point connects cache and queue Redis in the background, so Redis ready messages may appear before or after its listening message. For example:
 
@@ -182,11 +198,11 @@ From the project root in another PowerShell terminal, create the container once:
 docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind,source=$($PWD.Path)\nginx\nginx.conf,target=/etc/nginx/nginx.conf,readonly" nginx:stable-alpine
 ```
 
-For later runs, use `docker start url-shortener-nginx`. Nginx reaches the host applications through `host.docker.internal:8000` and `:8001`. The mounted config is `nginx/nginx.conf`.
+For later runs, use `docker start url-shortener-nginx`. Nginx reaches creation instances through `host.docker.internal:8000` and `:8002`, and redirect instances through `host.docker.internal:8001` and `:8003`. The mounted config is `nginx/nginx.conf`.
 
-Check each service directly at `http://localhost:8000/health` and `http://localhost:8001/health`. Through 8080, `/health` is routed only to the redirect service; it does not represent both services. Both terminals log handled requests. Generated links continue to use 8080.
+Check each instance directly at ports 8000, 8001, 8002, and 8003 using `/health`. Through 8080, `/health` reaches the redirect group only; it does not check the creation group or all instances. All four terminals log handled requests. Generated links continue to use 8080.
 
-The mounted config has separate creation_service and redirect_service upstreams. `location = /links` matches the exact path; `location /` forwards remaining paths to redirect. It is path routing, not round-robin between different service roles. Each service's Express router handles HTTP methods. `/links/` does not match the exact creation location; use the documented `/links` path. After editing the config, validate with `docker exec url-shortener-nginx nginx -t` and, on success, apply it with `docker exec url-shortener-nginx nginx -s reload`.
+The mounted config has a creation_service upstream with 8000/8002 and a redirect_service upstream with 8001/8003. Each group uses default round robin and passive failure handling. `location = /links` matches the exact path; `location /` forwards remaining paths to redirect. It is path routing, not round-robin between different service roles. Each service's Express router handles HTTP methods. `/links/` does not match the exact creation location; use the documented `/links` path. After editing the config, validate with `docker exec url-shortener-nginx nginx -t` and, on success, apply it with `docker exec url-shortener-nginx nginx -s reload`.
 
 ### 7. Set up the analytics queue and workers
 
@@ -399,14 +415,30 @@ The EXPLAIN estimates do not prove a 2x speedup. The manual replay deliberately 
 | Redirect stopped | Creation POST stayed 201; redirects/stats returned 502; they recovered after redirect restarted | User confirmation of the guided test |
 | Restart response clarification | Agent independently observed 302 through 8080 and directly on 8001, plus 200 stats | Curl requests without following redirects; the user's 403 was likely from the destination after redirect following |
 
-Each role currently has one instance. These tests demonstrate independence of the HTTP service roles; they do not demonstrate replacement-instance failover or higher throughput. A real destination may reject the client after a successful shortener redirect. Verify the shortener's status without following redirects.
+At Version 6, each role had one instance. Those historical tests demonstrated independence of the HTTP service roles, not replacement-instance failover or higher throughput. Version 7 replica checks are recorded below. A real destination may reject the client after a successful shortener redirect. Verify the shortener's status without following redirects.
+
+### Version 7: verified replicas and failover
+
+| Scenario | Observed result | Evidence |
+| --- | --- | --- |
+| Extra instances | 8002 creation and 8003 redirect health checks returned 200 | User confirmation |
+| Creation distribution | Four POST requests returned 201; logs appeared on 8000 and 8002 | User confirmation of guided test |
+| Redirect distribution | Four short-link requests returned 302; logs appeared on 8001 and 8003 | User confirmation of guided test |
+| Creation 8000 stopped | Four POST requests stayed 201 and reached 8002 | User confirmation of guided test |
+| Creation recovery | After restarting 8000 and waiting, both creation instances received requests again | User confirmation |
+| Redirect 8001 stopped | Four redirects stayed 302; stats returned 200 through surviving 8003 | User confirmation of guided test |
+| Redirect recovery | After restarting 8001 and waiting, both redirect instances received requests again | User confirmation |
+
+These are local process-outage tests. Nginx uses passive failures from live requests; no active background health probe was added. Its default max_fails=1 and fail_timeout=10s mean a failed peer can be excluded temporarily before live requests try it again. The recovery exercise allowed 10-15 seconds after restart, then sent traffic. See [Nginx load-balancing docs](https://nginx.org/en/docs/http/load_balancing.html).
 
 ## Current limits and future work
 
-This is a local learning setup with one creation process, one redirect process, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. A stopped role returns 502 for its routed requests; the other role can continue when shared dependencies are healthy. A machine failure still stops the entire setup. `localhost` links are not public shareable links.
+This is a local learning setup with two creation processes, two redirect processes, two analytics worker processes, one Nginx container, one MySQL database, and separate Redis cache and queue containers on the same computer. One stopped HTTP instance can be served by its healthy same-role peer. If every instance of a role is unavailable, that role's requests can fail with 502. A machine failure still stops the entire setup. `localhost` links are not public shareable links.
+
+The replica tests do not prove higher throughput or safe retries of partially completed POST requests. POST idempotency is still absent. Each redirect instance has its own connection pools and in-memory cache cooldown; MySQL, Nginx, and the host remain shared failure points.
 
 The waiting deadline does not cancel underlying Redis commands. Cooldown state is per application process; simultaneous misses are not coalesced. Cache outages transfer traffic to MySQL. The queue limit is not an HTTP rate limit, and there is no overall HTTP request deadline.
 
-Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. Version 5 and the agreed Version 6 service-separation milestone are closed. Follow-up work includes replay tooling, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
+Version 5 now includes background click analytics, retries, a failed stream, and pending recovery. The agreed Version 5, Version 6, and Version 7 learning milestones are closed. Follow-up work includes replay tooling, stream retention, better failure classification, and a later Kafka migration. Failed-stream publishing and original ACK are separate operations, so a crash between them can create duplicate failed-stream entries. Queue outages can lose click events because redirects continue without a durable application outbox. A publishing timeout does not cancel an underlying Redis append, so its final outcome can be uncertain. The 60-second reclaim threshold is an idle-time rule, not proof that another worker crashed; slow live work can also be claimed.
 
 Later work includes automated tests, deployment, rate limiting, abuse controls, URL expiry, and measured scaling. POST retry idempotency is not implemented. Cache TTL expires only the cached copy; URL mappings currently have no expiry. There are no user accounts, QR codes, or destination safety checks. Code generation uses `Math.random()`; short codes should not be treated as secrets or access controls.
