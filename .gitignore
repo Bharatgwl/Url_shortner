@@ -2,3 +2,9 @@
 node_modules/
 practice.js
 queue-test.js
+Linkedin/
+
+# Local Docker migration snapshot and verification metadata
+docker/mysql/20-existing-data.sql
+docker/mysql/*.tmp
+docker/migration-report.json

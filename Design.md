@@ -327,3 +327,13 @@ These V7 runtime results are user-reported confirmations of the guided tests; th
 ### Milestone closure
 
 V7 closes at two HTTP replicas per role, Nginx per-role round robin, single-instance failover, recovery, and documentation. This is local process redundancy, with all components on one machine. Nginx, MySQL, and the host remain shared failure points. Queue/cache delivery limitations, stream retention, replay tooling, broader performance testing, graceful shutdown, Kafka, and deployment remain separate future work.
+
+## Project relocation and bind mounts
+
+The Nginx container binds the project's `nginx/nginx.conf` to `/etc/nginx/nginx.conf` read-only. Docker saves the host source path when the container is created. Moving the source folder leaves an existing container pointing at the old location; `docker start` and `nginx -s reload` do not update that saved mount.
+
+The README now resolves `.\nginx\nginx.conf` from the current project root with PowerShell `Resolve-Path` before creating the container. After each folder move, recreate only the Nginx container using that command. A portable creation command resolves the new path each time it is run; an already-created container does not automatically follow folder moves. The existing image, 127.0.0.1:8080 binding, upstream ports, and read-only mount are preserved by the documented procedure. See [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
+
+Relocation review found relative Node.js module imports and no old absolute project paths in the application or documentation. The root `.env` and dependencies were present in the moved folder; run Node.js service and worker commands from that root so dotenv finds `.env`. Both existing Redis containers use Docker-managed data volumes rather than project-folder bind mounts. No application settings or source changes were needed for this folder move.
+
+Verification for this documentation update consisted of source-path review, successful syntax checks for all project JavaScript files, and read-only inspection of existing container mounts. The Nginx recreation commands were provided to the user; this review did not recreate or restart containers or repeat application request tests.

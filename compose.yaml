@@ -1,0 +1,193 @@
+name: url-shortener
+
+# One Node.js image is reused by all four HTTP instances and both workers.
+x-app: &app
+  image: bharatgwl/url-shortener-app:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  init: true
+  restart: unless-stopped
+  environment: &app-environment
+    NODE_ENV: production
+    DB_HOST: mysql
+    DB_PORT: "3306"
+    DB_USER: shortener
+    DB_PASSWORD: ${DOCKER_DB_PASSWORD:-shortener-local-password}
+    DB_NAME: url_shortner
+    BASE_URL: http://localhost:${DOCKER_HTTP_PORT:-8080}
+    REDIS_URL: redis://cache:6379
+    QUEUE_REDIS_URL: redis://queue:6379
+
+x-http-health: &http-health
+  test:
+    - CMD
+    - node
+    - --input-type=module
+    - -e
+    - "const response = await fetch('http://127.0.0.1:' + process.env.PORT + '/health', { signal: AbortSignal.timeout(2000) }); if (response.status !== 200) process.exit(1);"
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 10s
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: url_shortner
+      MYSQL_USER: shortener
+      MYSQL_PASSWORD: ${DOCKER_DB_PASSWORD:-shortener-local-password}
+      MYSQL_ROOT_PASSWORD: ${DOCKER_MYSQL_ROOT_PASSWORD:-shortener-local-root-password}
+    ports:
+      - "127.0.0.1:${DOCKER_MYSQL_PORT:-3307}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - type: bind
+        source: ./docker/mysql
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'MYSQL_PWD="$${MYSQL_PASSWORD}" mysql --protocol=TCP --host=127.0.0.1 --user="$${MYSQL_USER}" --database="$${MYSQL_DATABASE}" --silent --execute="SELECT 1"'
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DOCKER_CACHE_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  queue:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DOCKER_QUEUE_PORT:-6380}:6379"
+    volumes:
+      - queue_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # This one-time task creates the stream/group, or accepts an existing group.
+  queue-init:
+    <<: *app
+    restart: "no"
+    command: ["node", "docker/init-queue.js"]
+    depends_on:
+      queue:
+        condition: service_healthy
+
+  creation-1:
+    <<: *app
+    command: ["node", "creationServer.js"]
+    environment:
+      <<: *app-environment
+      PORT: "8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck: *http-health
+
+  creation-2:
+    <<: *app
+    command: ["node", "creationServer.js"]
+    environment:
+      <<: *app-environment
+      PORT: "8002"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck: *http-health
+
+  redirect-1:
+    <<: *app
+    command: ["node", "redirectServer.js"]
+    environment:
+      <<: *app-environment
+      PORT: "8001"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      queue-init:
+        condition: service_completed_successfully
+    healthcheck: *http-health
+
+  redirect-2:
+    <<: *app
+    command: ["node", "redirectServer.js"]
+    environment:
+      <<: *app-environment
+      PORT: "8003"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      queue-init:
+        condition: service_completed_successfully
+    healthcheck: *http-health
+
+  worker-1:
+    <<: *app
+    command: ["node", "workers/clickWorker.js", "worker-1"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      queue-init:
+        condition: service_completed_successfully
+
+  worker-2:
+    <<: *app
+    command: ["node", "workers/clickWorker.js", "worker-2"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      queue-init:
+        condition: service_completed_successfully
+
+  nginx:
+    image: bharatgwl/url-shortener-nginx:latest
+    build:
+      context: .
+      dockerfile: docker/nginx.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DOCKER_HTTP_PORT:-8080}:80"
+    depends_on:
+      creation-1:
+        condition: service_healthy
+      creation-2:
+        condition: service_healthy
+      redirect-1:
+        condition: service_healthy
+      redirect-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  mysql_data:
+    name: url-shortener-compose-mysql-data
+  queue_data:
+    name: url-shortener-compose-queue-data

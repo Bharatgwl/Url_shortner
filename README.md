@@ -77,6 +77,20 @@ nginx/nginx.conf
 
 These are two service roles, each running in two independent Node.js processes. They share one repository, service modules, and MySQL database; all components still run on one computer. `server.js` and `routes/linkRoutes.js` remain as the older combined entry point and router. V6 and V7 startup use the two new entry points below; V7 runs each one twice on different ports.
 
+## Run everything with Docker Compose
+
+With Docker Desktop running, open a terminal in this project root and run:
+
+```powershell
+docker compose up -d --build
+```
+
+This starts Nginx, four HTTP instances, two analytics workers, MySQL, cache Redis, queue Redis, and automatic stream/group setup. Open `http://localhost:8080`. Use `docker compose ps -a` for status, `docker compose logs -f` for logs, and `docker compose stop` to stop the application.
+
+After the images are published, another developer can run `docker compose pull` followed by `docker compose up -d --no-build`. The custom image names use the `bharatgwl` Docker Hub account.
+
+MySQL and queue data use persistent named volumes. See [DOCKER.md](DOCKER.md) for migration, Redis Insight and MySQL Workbench connections, restart commands, and moving the project folder. The manual setup below documents the original host-based workflow.
+
 ## Requirements
 
 - Node.js with ES module and top-level await support, and npm.
@@ -192,13 +206,44 @@ If Redis is down, connection errors and reconnect attempts are logged, but MySQL
 
 ### 6. Start Nginx
 
-From the project root in another PowerShell terminal, create the container once:
+From the project root in another PowerShell terminal, create the container once. These commands resolve the config from your current project folder, so they work wherever the project is located:
 
 ```powershell
-docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind,source=$($PWD.Path)\nginx\nginx.conf,target=/etc/nginx/nginx.conf,readonly" nginx:stable-alpine
+$nginxConfig = (Resolve-Path .\nginx\nginx.conf -ErrorAction Stop).Path
+docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind,source=$nginxConfig,target=/etc/nginx/nginx.conf,readonly" nginx:stable-alpine
+docker exec url-shortener-nginx nginx -t
 ```
 
-For later runs, use `docker start url-shortener-nginx`. Nginx reaches creation instances through `host.docker.internal:8000` and `:8002`, and redirect instances through `host.docker.internal:8001` and `:8003`. The mounted config is `nginx/nginx.conf`.
+For later runs **in the same folder**, use `docker start url-shortener-nginx`. After moving or renaming the project folder, follow the relocation steps below instead. Docker stores the resolved bind-mount source when the container is created; starting it again keeps that saved source.
+
+Nginx reaches creation instances through `host.docker.internal:8000` and `:8002`, and redirect instances through `host.docker.internal:8001` and `:8003`. The mounted config is `nginx/nginx.conf`.
+
+#### After moving or renaming the project folder
+
+Open PowerShell in the **new project root**. Resolve the file before removing the container, then recreate only Nginx:
+
+```powershell
+$nginxConfig = (Resolve-Path .\nginx\nginx.conf -ErrorAction Stop).Path
+docker stop url-shortener-nginx
+docker rm url-shortener-nginx
+docker run -d --name url-shortener-nginx -p 127.0.0.1:8080:80 --mount "type=bind,source=$nginxConfig,target=/etc/nginx/nginx.conf,readonly" nginx:stable-alpine
+docker exec url-shortener-nginx nginx -t
+docker inspect url-shortener-nginx --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{end}}'
+```
+
+If Nginx is already stopped, skip `docker stop`. Stop if any command fails. The inspection should show the config under the new project folder. The container image, public port, upstream ports, and read-only config mount stay the same. Docker reuses the local image when available.
+
+The Node.js imports and commands use relative project paths. Run the service and worker commands from the new project root so `dotenv/config` finds that folder's `.env`. Move `.env` with the project and reopen terminals in the new folder. Moving this folder does not require changing database credentials, service ports, or `BASE_URL` when the services still run on the same host and ports.
+
+The existing cache and queue containers store Redis data in Docker-managed volumes. Keep those containers and volumes; their data paths do not depend on the project folder. MySQL data is also managed separately from this source folder. A fresh clone without dependencies needs `npm install` as documented above.
+
+Once the four application instances are running, check the public entry point:
+
+```powershell
+curl.exe -i http://localhost:8080/health
+```
+
+Expected result: `200 OK` from one redirect instance. Check the other service instances directly as described below. See [Docker bind-mount documentation](https://docs.docker.com/engine/storage/bind-mounts/) for host-path behavior.
 
 Check each instance directly at ports 8000, 8001, 8002, and 8003 using `/health`. Through 8080, `/health` reaches the redirect group only; it does not check the creation group or all instances. All four terminals log handled requests. Generated links continue to use 8080.
 

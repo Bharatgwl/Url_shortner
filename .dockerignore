@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+node_modules
+Linkedin
+diagrams
+*.md
+docker/mysql/20-existing-data.sql
+docker/mysql/*.tmp
+docker/migration-report.json
+*.log
